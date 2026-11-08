@@ -259,20 +259,24 @@ test('registers the overlay and the General settings row, and loads no Harness c
 test('both modes are on by default and toggle independently', () => {
   const app = load()
   const { readPrefs, setPref } = app.module.__testing
-  same(readPrefs(), { next: true, continue: true })
+  same(readPrefs(), { next: true, continue: true, model: '' })
   setPref('continue', false)
-  same(readPrefs(), { next: true, continue: false })
-  same(JSON.parse(app.localStorage.saved), { next: true, continue: false })
+  same(readPrefs(), { next: true, continue: false, model: '' })
+  same(JSON.parse(app.localStorage.saved), { next: true, continue: false, model: '' })
   setPref('next', false)
-  same(readPrefs(), { next: false, continue: false })
+  same(readPrefs(), { next: false, continue: false, model: '' })
 })
 
 test('saved preferences are restored, and blocked storage still works for the window', () => {
-  const restored = load({ prefs: { next: false, continue: true } })
-  same(restored.module.__testing.readPrefs(), { next: false, continue: true })
+  const restored = load({ prefs: { next: false, continue: true, model: ' claude-sonnet-5-5 ' } })
+  same(restored.module.__testing.readPrefs(), { next: false, continue: true, model: 'claude-sonnet-5-5' })
+
+  // Older saved preferences have no model: the Session's model answers.
+  const older = load({ prefs: { next: true, continue: false } })
+  same(older.module.__testing.readPrefs(), { next: true, continue: false, model: '' })
 
   const blocked = load({ storageBlocked: true })
-  same(blocked.module.__testing.readPrefs(), { next: true, continue: true })
+  same(blocked.module.__testing.readPrefs(), { next: true, continue: true, model: '' })
   assert.doesNotThrow(() => blocked.module.__testing.setPref('next', false))
   assert.equal(blocked.module.__testing.readPrefs().next, false)
 })
@@ -281,14 +285,14 @@ test('another window changing the preference is picked up through the storage ev
   const app = load()
   const onStorage = app.windowListeners.get('storage')
   onStorage({ key: 'something-else', newValue: '{"next":false}' })
-  same(app.module.__testing.readPrefs(), { next: true, continue: true })
-  onStorage({ key: PREFERENCE_KEY, newValue: JSON.stringify({ next: false, continue: true }) })
-  same(app.module.__testing.readPrefs(), { next: false, continue: true })
+  same(app.module.__testing.readPrefs(), { next: true, continue: true, model: '' })
+  onStorage({ key: PREFERENCE_KEY, newValue: JSON.stringify({ next: false, continue: true, model: 'claude-sonnet-5-5' }) })
+  same(app.module.__testing.readPrefs(), { next: false, continue: true, model: 'claude-sonnet-5-5' })
   onStorage({ key: PREFERENCE_KEY, newValue: null })
-  same(app.module.__testing.readPrefs(), { next: true, continue: true })
+  same(app.module.__testing.readPrefs(), { next: true, continue: true, model: '' })
 })
 
-test('the settings row has one switch per mode, a cost note, and a status line', () => {
+test('the settings row has one switch per mode, a model field, a cost note, and a status line', () => {
   const app = load()
   const element = app.registered['settings.general.item'].component()
   const row = element.type(element.props)
@@ -296,9 +300,67 @@ test('the settings row has one switch per mode, a cost note, and a status line',
   same(toggles.map((toggle) => toggle.props.title), ['Suggest my next message', 'Continue my draft with Tab'])
   assert.ok(toggles.every((toggle) => toggle.props.checked === true))
   toggles[1].props.onChange(false)
-  same(app.module.__testing.readPrefs(), { next: true, continue: false })
+  same(app.module.__testing.readPrefs(), { next: true, continue: false, model: '' })
   const status = row.children.find((child) => child && child.type && child.type.name === 'StatusLine')
   assert.ok(status, 'the row ends with the status line')
+  const field = row.children.find((child) => child && child.type && child.type.name === 'ModelField')
+  assert.ok(field, 'the row has the model field')
+  assert.equal(field.props.title, 'Model for suggestions')
+  assert.equal(field.props.placeholder, 'Same as the session')
+})
+
+function modelInput(app) {
+  const element = app.registered['settings.general.item'].component()
+  const row = element.type(element.props)
+  const field = row.children.find((child) => child && child.type && child.type.name === 'ModelField')
+  return field.type(field.props).children.find((child) => child && child.type === 'input')
+}
+
+test('a model typed in Settings is saved when the box loses focus, trimmed, and empty means follow the session', () => {
+  const app = load()
+  assert.equal(modelInput(app).props.defaultValue, '')
+  modelInput(app).props.onBlur({ target: { value: '  claude-sonnet-5-5 ' } })
+  assert.equal(app.module.__testing.readPrefs().model, 'claude-sonnet-5-5')
+  same(JSON.parse(app.localStorage.saved), { next: true, continue: true, model: 'claude-sonnet-5-5' })
+  // The box shows the saved value and is reloaded when it changes elsewhere.
+  assert.equal(modelInput(app).props.defaultValue, 'claude-sonnet-5-5')
+  assert.equal(modelInput(app).props.key, 'claude-sonnet-5-5')
+  assert.equal(modelInput(app).props.maxLength, 200)
+
+  modelInput(app).props.onBlur({ target: { value: '   ' } })
+  assert.equal(app.module.__testing.readPrefs().model, '', 'blank goes back to following the session')
+})
+
+test('leaving the model box unchanged saves nothing, and Enter finishes editing', () => {
+  const app = load({ prefs: { next: true, continue: true, model: 'claude-sonnet-5-5' } })
+  modelInput(app).props.onBlur({ target: { value: 'claude-sonnet-5-5' } })
+  assert.equal(app.localStorage.saved, undefined, 'no write for an unchanged value')
+
+  let blurred = 0
+  const target = { blur: () => { blurred += 1 } }
+  modelInput(app).props.onKeyDown({ key: 'Enter', isComposing: false, target })
+  assert.equal(blurred, 1)
+  modelInput(app).props.onKeyDown({ key: 'Enter', isComposing: true, target })
+  modelInput(app).props.onKeyDown({ key: 'a', target })
+  assert.equal(blurred, 1, 'an IME Enter and other keys do not finish editing')
+})
+
+test('the model from Settings goes with every request, and is left out when empty', async () => {
+  const withModel = load({ prefs: { next: true, continue: true, model: 'claude-sonnet-5-5' }, fetch: async () => streamResponse(sse({ type: 'done', items: ['x'], seq: 1 })) })
+  await withModel.render({ draft: 'Can you also' }).request('continue', 'Can you also')
+  await withModel.render({ draft: '' }).request('next', '')
+  same(JSON.parse(withModel.fetchCalls[0].init.body), { sessionId: 's1', mode: 'continue', draft: 'Can you also', model: 'claude-sonnet-5-5' })
+  same(JSON.parse(withModel.fetchCalls[1].init.body), { sessionId: 's1', mode: 'next', draft: '', model: 'claude-sonnet-5-5' })
+
+  const without = load({ fetch: async () => streamResponse(sse({ type: 'done', items: ['x'], seq: 1 })) })
+  await without.render({ draft: '' }).request('next', '')
+  same(JSON.parse(without.fetchCalls[0].init.body), { sessionId: 's1', mode: 'next', draft: '' })
+  assert.ok(!('model' in JSON.parse(without.fetchCalls[0].init.body)))
+
+  // A change made in Settings applies to the next request without reloading the page.
+  without.module.__testing.setPref('model', 'deepseek-flash')
+  await without.render({ draft: '' }).request('next', '')
+  assert.equal(JSON.parse(without.fetchCalls[1].init.body).model, 'deepseek-flash')
 })
 
 test('the status line shows idle, success, cache hits and failures', () => {

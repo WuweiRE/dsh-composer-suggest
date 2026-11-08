@@ -40,6 +40,9 @@ window.__ModuleLoader__.load({
       '.cs-switch:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}',
       '.cs-switch__thumb{display:block;width:16px;height:16px;border-radius:50%;background:var(--dsw-alias-bg-base);transition:transform .12s}',
       '.cs-switch[aria-checked="true"] .cs-switch__thumb{transform:translate(16px)}',
+      '.cs-input{box-sizing:border-box;flex:0 0 auto;width:220px;height:28px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px}',
+      '.cs-input::placeholder{color:var(--dsw-alias-label-secondary)}',
+      '.cs-input:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}',
     ].join('')
 
     function Switch({ checked, label, onChange, disabled }) {
@@ -67,6 +70,8 @@ window.__ModuleLoader__.load({
 
     /** Wait for the settled UI before asking, so a fresh turn is fully committed. */
     const SETTLE_MS = 600
+    /** Longest model id the Settings field keeps; the Host refuses longer ones. */
+    const MAX_MODEL_CHARS = 200
     /** How long a "nothing to continue" notice stays in the composer. */
     const NOTICE_MS = 2600
     /** The Host bounds the draft too; this keeps the request body small. */
@@ -95,6 +100,9 @@ window.__ModuleLoader__.load({
         nextHint: 'After a reply, show the message you are most likely to send next.',
         continue: 'Continue my draft with Tab',
         continueHint: 'With text in the composer and the caret at its end, press Tab. The model continues it using the conversation above; press Tab again to accept. Nothing is asked until you press Tab, and Tab keeps its usual job anywhere else.',
+        model: 'Model for suggestions',
+        modelHint: 'Leave empty to use the current session\'s model, or enter a model id such as claude-sonnet-5-5 to use that one instead. If no provider offers it, the status line below says so.',
+        modelPlaceholder: 'Same as the session',
         cost: 'Every suggestion is a model call and uses tokens. Saved in this browser on this device.',
         pending: 'Continuing…',
         statusIdle: 'No suggestion requested yet.',
@@ -114,6 +122,9 @@ window.__ModuleLoader__.load({
         nextHint: '回复结束后，显示你最可能接着发送的消息。',
         continue: '用 Tab 续写我的草稿',
         continueHint: '输入框里有内容且光标在末尾时按 Tab，模型会结合上面的对话续写，再按一次 Tab 采纳。不按 Tab 就不会请求模型，其他情况下 Tab 照常使用。',
+        model: '建议使用的模型',
+        modelHint: '留空则使用当前会话的模型；填写模型 ID（如 claude-sonnet-5-5）则改用该模型。找不到时，下方状态行会提示。',
+        modelPlaceholder: '与会话相同',
         cost: '每次建议都会调用一次模型并消耗 token。设置保存在当前设备的浏览器中。',
         pending: '正在续写…',
         statusIdle: '尚未请求过建议。',
@@ -127,12 +138,16 @@ window.__ModuleLoader__.load({
     }
 
     const PREFERENCE_KEY = 'dsh-composer-suggest.prefs'
-    let prefs = { next: true, continue: true }
+    /** Both modes are on, and the Session's own model answers, until the user says otherwise. */
+    const DEFAULT_PREFS = { next: true, continue: true, model: '' }
+    function parsePrefs(stored) {
+      if (stored === null || typeof stored !== 'object') return DEFAULT_PREFS
+      const model = typeof stored.model === 'string' ? stored.model.trim().slice(0, MAX_MODEL_CHARS) : ''
+      return { next: stored.next !== false, continue: stored.continue !== false, model }
+    }
+    let prefs = DEFAULT_PREFS
     try {
-      const stored = JSON.parse(window.localStorage.getItem(PREFERENCE_KEY) || 'null')
-      if (stored !== null && typeof stored === 'object') {
-        prefs = { next: stored.next !== false, continue: stored.continue !== false }
-      }
+      prefs = parsePrefs(JSON.parse(window.localStorage.getItem(PREFERENCE_KEY) || 'null'))
     } catch {
       // Restricted storage keeps the preference in memory for this window.
     }
@@ -215,12 +230,47 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /** One text setting. Uncontrolled so typing is never interrupted; saved when the box loses focus. */
+    function ModelField({ title, hint, placeholder, value, onCommit }) {
+      return h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, padding: '12px 0' } },
+        h('div', null,
+          h('div', { style: { fontSize: 14, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)' } }, title),
+          h('div', { style: { fontSize: 12, lineHeight: '18px', marginTop: 2, color: 'var(--dsw-alias-label-secondary)' } }, hint),
+        ),
+        h('input', {
+          // The key reloads the box when the saved value changes somewhere else (another window).
+          key: value,
+          className: 'cs-input',
+          type: 'text',
+          defaultValue: value,
+          placeholder,
+          maxLength: MAX_MODEL_CHARS,
+          spellCheck: false,
+          autoCapitalize: 'off',
+          autoCorrect: 'off',
+          'aria-label': title,
+          onBlur: (event) => onCommit(event.target.value.trim()),
+          onKeyDown: (event) => {
+            // Enter finishes editing; an IME candidate window keeps its own Enter.
+            if (event.key === 'Enter' && event.isComposing !== true) event.target.blur()
+          },
+        }),
+      )
+    }
+
     function SuggestionSetting({ t }) {
       const current = usePrefs()
       return h('div', { style: { padding: '4px 0 12px', borderBottom: '0.5px solid var(--dsw-alias-border-l1)' } },
         h('style', null, SWITCH_CSS),
         h(SettingRow, { title: t('next'), hint: t('nextHint'), checked: current.next, onChange: (value) => setPref('next', value) }),
         h(SettingRow, { title: t('continue'), hint: t('continueHint'), checked: current.continue, onChange: (value) => setPref('continue', value) }),
+        h(ModelField, {
+          title: t('model'),
+          hint: t('modelHint'),
+          placeholder: t('modelPlaceholder'),
+          value: current.model,
+          onCommit: (value) => { if (value !== current.model) setPref('model', value) },
+        }),
         h('div', { style: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)' } }, t('cost')),
         h(StatusLine, { t }),
       )
@@ -569,7 +619,12 @@ window.__ModuleLoader__.load({
             const response = await fetch(ENDPOINT, {
               method: 'POST',
               headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
-              body: JSON.stringify({ sessionId, mode, draft: draftText }),
+              // A model typed in Settings wins over the Host configuration; empty means not set.
+              body: JSON.stringify(
+                prefs.model === ''
+                  ? { sessionId, mode, draft: draftText }
+                  : { sessionId, mode, draft: draftText, model: prefs.model },
+              ),
               signal: controller.signal,
             })
             if (controller.signal.aborted) return
@@ -1020,10 +1075,7 @@ window.__ModuleLoader__.load({
           const onStorage = (event) => {
             if (event.key !== PREFERENCE_KEY && event.key !== null) return
             try {
-              const stored = JSON.parse(event.newValue || 'null')
-              prefs = stored !== null && typeof stored === 'object'
-                ? { next: stored.next !== false, continue: stored.continue !== false }
-                : { next: true, continue: true }
+              prefs = parsePrefs(JSON.parse(event.newValue || 'null'))
             } catch {
               return
             }

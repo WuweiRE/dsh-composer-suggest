@@ -295,6 +295,64 @@ test('with no Session route and no default model there is no route to ask', asyn
   assert.equal(harness.llmCalls.length, 0)
 })
 
+test('a model named in the request wins over the configuration and the Session', async () => {
+  const harness = makeHarness({ reply: 'go', config: { model: 'deepseek-flash' } })
+  harness.sessions.set('s1', makeSession(CONVERSATION, { route: { provider: 'deepseek-zcode', model: 'deepseek-flash' } }))
+  const done = sseEvents(await callRoute(harness, { sessionId: 's1', model: 'claude-sonnet-5-5' })).at(-1)
+  assert.deepEqual(done.route, { provider: 'claude2', model: 'claude-sonnet-5-5' })
+  assert.equal(harness.llmCalls[0].config.provider, 'claude2')
+  assert.equal(harness.llmCalls[0].config.model, 'claude-sonnet-5-5')
+})
+
+test('a provider named with the model is used as given, and a blank model falls back to the configuration', async () => {
+  const harness = makeHarness({ reply: 'go' })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  await callRoute(harness, { sessionId: 's1', model: 'claude-sonnet-5-5', provider: 'claude-zcode' })
+  assert.equal(harness.llmCalls[0].config.provider, 'claude-zcode')
+  assert.equal(harness.listCalls.length, 0, 'an explicit pair needs no catalog lookup')
+
+  const session = harness.sessions.get('s1')
+  session.seq = 2
+  await callRoute(harness, { sessionId: 's1', model: '   ', provider: 'ignored' })
+  assert.equal(harness.llmCalls[1].config.provider, 'claude2', 'blank model: the Session route, the provider is ignored')
+})
+
+test('the result cache keeps models apart', async () => {
+  const harness = makeHarness({ reply: 'go' })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  await callRoute(harness, { sessionId: 's1' })
+  await callRoute(harness, { sessionId: 's1', model: 'deepseek-flash' })
+  assert.equal(harness.llmCalls.length, 2, 'another model is another request')
+  await callRoute(harness, { sessionId: 's1', model: 'deepseek-flash' })
+  assert.equal(harness.llmCalls.length, 2, 'the same model is served from the cache')
+})
+
+test('two models in the request are each looked up once, independently', async () => {
+  const harness = makeHarness({ reply: 'go' })
+  const session = makeSession(CONVERSATION, { route: { provider: 'deepseek-zcode', model: 'deepseek-flash' } })
+  harness.sessions.set('s1', session)
+  await callRoute(harness, { sessionId: 's1', model: 'claude-sonnet-5-5' })
+  await callRoute(harness, { sessionId: 's1', model: 'claude-opus-5-5' })
+  const lookups = harness.listCalls.length
+  session.seq = 2
+  await callRoute(harness, { sessionId: 's1', model: 'claude-sonnet-5-5' })
+  await callRoute(harness, { sessionId: 's1', model: 'claude-opus-5-5' })
+  assert.equal(harness.listCalls.length, lookups, 'both routes are remembered')
+  assert.equal(harness.llmCalls[1].config.model, 'claude-opus-5-5')
+})
+
+test('an unknown model in the request is reported, and an oversized one is refused', async () => {
+  const harness = makeHarness({ reply: 'go' })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const unknown = sseEvents(await callRoute(harness, { sessionId: 's1', model: 'no-such-model' })).at(-1)
+  assert.equal(unknown.reason, 'model-unavailable')
+  assert.equal(harness.llmCalls.length, 0)
+
+  const huge = await callRoute(harness, { sessionId: 's1', model: 'm'.repeat(201) })
+  assert.equal(huge.status, 400)
+  assert.equal(jsonBody(huge).reason, 'invalid-model')
+})
+
 test('effort selection prefers the configured id, then the lowest advertised', () => {
   const { selectEffort } = __testing
   assert.equal(selectEffort(SONNET_MODEL, 'low'), 'low')

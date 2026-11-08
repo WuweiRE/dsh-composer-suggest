@@ -92,13 +92,14 @@ export function apply(ctx, config) {
   const options = resolveOptions(config)
   const cache = new Map()
   const inflight = new Set()
-  const routes = { pinned: undefined }
+  // Resolved provider per pinned model id, so a model is looked up among the providers once.
+  const routes = { pinned: new Map() }
 
   ctx.effect(() => () => {
     for (const controller of inflight) controller.abort()
     inflight.clear()
     cache.clear()
-    routes.pinned = undefined
+    routes.pinned.clear()
   })
 
   ctx.effect(() =>
@@ -140,7 +141,7 @@ function textOption(value, maximum) {
 
 async function serveStream(ctx, options, routes, cache, inflight, request, response) {
   try {
-    const plan = await planRequest(ctx, request, response)
+    const plan = await planRequest(ctx, options, request, response)
     if (plan === null) return
     if (plan.error !== undefined) {
       respond(response, plan.status, { items: [], reason: plan.error })
@@ -151,7 +152,7 @@ async function serveStream(ctx, options, routes, cache, inflight, request, respo
     openStream(response)
     try {
       sendEvent(response, { type: 'meta', mode: plan.mode, seq: plan.seq })
-      const result = await runPrediction(ctx, options, routes, cache, inflight, plan, [disconnect.signal], (text) => {
+      const result = await runPrediction(ctx, plan.options, routes, cache, inflight, plan, [disconnect.signal], (text) => {
         if (!disconnect.signal.aborted) sendEvent(response, { type: 'delta', text })
       })
       if (disconnect.signal.aborted) return
@@ -189,7 +190,7 @@ function describeError(error) {
  * Read and validate one request body, resolving the live Session it names.
  * @returns `null` when the response was already written, a plan, or an error.
  */
-async function planRequest(ctx, request, response) {
+async function planRequest(ctx, baseOptions, request, response) {
   const admission = ctx.connection.admit(request)
   if ('rejection' in admission) {
     return { status: admission.rejection, error: admission.rejection === 401 ? 'unauthorized' : 'forbidden' }
@@ -225,10 +226,17 @@ async function planRequest(ctx, request, response) {
   const draft = mode === 'continue' && typeof body.draft === 'string' ? body.draft.slice(-MAX_DRAFT_CHARS) : ''
   if (mode === 'continue' && draft.trim() === '') return { status: 200, error: 'no-draft' }
 
-  const seq = Number(session.seq)
-  const key = JSON.stringify([sessionId, seq, mode, draft])
+  // The Client may name the model for this request (its Settings field); that wins over the
+  // configuration. A model with no provider is looked up among the mounted providers.
+  const asked = typeof body.model === 'string' ? body.model.trim() : ''
+  const askedProvider = typeof body.provider === 'string' ? body.provider.trim() : ''
+  if (asked.length > 200 || askedProvider.length > 200) return { status: 400, error: 'invalid-model' }
+  const options = asked === '' ? baseOptions : { ...baseOptions, model: asked, provider: askedProvider }
 
-  return { sessionId, session, mode, draft, seq, key }
+  const seq = Number(session.seq)
+  const key = JSON.stringify([sessionId, seq, mode, draft, options.provider, options.model])
+
+  return { sessionId, session, mode, draft, seq, key, options }
 }
 
 /**
@@ -298,7 +306,7 @@ async function predict(ctx, options, routes, session, mode, draft, signal, onDel
     deadline.signal.throwIfAborted()
   } catch (error) {
     // A pinned route that stops working must be resolved again next time.
-    if (!signal.aborted) routes.pinned = undefined
+    if (!signal.aborted) routes.pinned.delete(options.model)
     throw error
   } finally {
     deadline.dispose()
@@ -366,7 +374,7 @@ function remember(cache, key, entry) {
 async function resolveRoute(ctx, routes, session, options, signal) {
   if (options.model === '') return sessionRoute(ctx, session)
   if (options.provider !== '') return { provider: options.provider, model: options.model }
-  if (routes.pinned !== undefined) return routes.pinned
+  if (routes.pinned.has(options.model)) return routes.pinned.get(options.model)
 
   const preferred = []
   const used = session.requestHeader?.()?.config
@@ -386,8 +394,9 @@ async function resolveRoute(ctx, routes, session, options, signal) {
     try {
       const models = await ctx.llm.listModels(provider)
       if (models.some((entry) => entry?.id === options.model)) {
-        routes.pinned = { provider, model: options.model }
-        return routes.pinned
+        const found = { provider, model: options.model }
+        routes.pinned.set(options.model, found)
+        return found
       }
     } catch {
       // A provider that cannot list its models is skipped.

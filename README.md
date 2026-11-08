@@ -42,8 +42,14 @@ DeepSeek Harness 0.2.2-rc.1. It needs a Harness that provides `conversation.inpu
 By default a suggestion is answered by the model the Session already uses, at that
 model's lowest reasoning effort, with no temperature set.
 
-To answer with a specific model instead, override the row in your profile's
-`cordis.patch.yml`. Any option you leave out keeps its default:
+To use another model, type its id (for example `claude-sonnet-5-5`) in
+**Settings → General → Model for suggestions** and press Enter. Leave it empty to follow
+the Session again. It is saved in the browser you typed it in, and the status line under
+it reports which route answered last or why a request failed.
+
+To set the model for every browser instead, override the row in your profile's
+`cordis.patch.yml`. Any option you leave out keeps its default, and a model typed in
+Settings wins over this:
 
 ```yaml
 - id: composer-suggest
@@ -55,7 +61,8 @@ To answer with a specific model instead, override the row in your profile's
 Without a `provider`, the model is looked up among the providers mounted in your
 profile, trying the Session's provider first. If none offers it, the request fails with
 `model-unavailable` instead of silently using another model. Set `provider` and `model`
-together to name the route exactly. See `cordis.patch.yml` for every option.
+together in the configuration to name the route exactly. See `cordis.patch.yml` for every
+option.
 
 ## Credits and licenses
 
@@ -70,7 +77,7 @@ plugins. Their license texts are kept in this repository, and
 
 What this project adds: continuation is triggered by Tab instead of running on every
 typing pause, a visible "Continuing…" state with cancel, separate switches for the two
-modes, model selection that follows the Session or pins a model, a status line in
+modes, a model setting that follows the Session or names a model, a status line in
 Settings, and short on-screen notices for empty or failed continuations.
 
 This project is released under the MIT License, Copyright (c) 2026 WuweiRE, see
