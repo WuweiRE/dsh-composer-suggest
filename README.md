@@ -12,6 +12,12 @@ Composer suggestions for the DeepSeek Harness Web UI.
 - **Tab** accepts a suggestion as an editable draft (nothing is sent),
   **Alt+Down / Alt+Up** cycle up to three candidates, **Esc** withdraws the offer, and
   typing discards it.
+- A suggestion longer than what is left of the line wraps in place, at the same column
+  the accepted text would, and the toolbar row below is pushed down to make room.
+  To do that the plugin sets a temporary bottom margin on the composer's scroll element
+  (the one marked `data-input-scroll`) and removes it when the suggestion goes away. If
+  a Harness update renames that element, the suggestion still shows but may cover the
+  toolbar until the selector in `client.js` is updated.
 - **Settings → General** has one switch per mode, and a status line that shows which
   model route answered last, how long it took, or why a request failed.
 

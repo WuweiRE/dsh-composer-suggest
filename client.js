@@ -62,7 +62,7 @@ window.__ModuleLoader__.load({
     }
 
     /** Small spinner shown while the model is continuing; slower under reduced motion. */
-    const SPIN_CSS = '.cs-spin{box-sizing:border-box;flex:none;width:10px;height:10px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:cs-spin .8s linear infinite}@keyframes cs-spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.cs-spin{animation-duration:2.4s}}'
+    const SPIN_CSS = '.cs-spin{display:inline-block;vertical-align:middle;margin:0 6px 0 2px;text-indent:0;box-sizing:border-box;flex:none;width:10px;height:10px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:cs-spin .8s linear infinite}@keyframes cs-spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.cs-spin{animation-duration:2.4s}}'
 
     const NS = 'composer-suggest'
     const ENDPOINT = '/composer-suggest/stream'
@@ -281,63 +281,79 @@ window.__ModuleLoader__.load({
     /** Per Session: the turn (Session seq) whose next-message offer was dismissed with Escape. */
     const dismissedSeqs = new Map()
 
-    const NEXT_GHOST_STYLE = {
+    /**
+     * The ghost is laid out like the text it stands for: it wraps at the editor's column the way
+     * the accepted text would. While it is taller than the editor, the Host's scroll element gets
+     * a bottom margin so the toolbar row is pushed down instead of being covered.
+     */
+    const GHOST_BASE_STYLE = {
       position: 'absolute',
-      display: 'flex',
-      alignItems: 'center',
-      gap: '8px',
+      display: 'block',
       boxSizing: 'border-box',
       fontFamily: 'inherit',
       fontSize: 'inherit',
       lineHeight: 'inherit',
       color: 'var(--dsw-alias-label-caption)',
-      background: 'var(--dsw-specific-input-major)',
-      overflow: 'hidden',
-      whiteSpace: 'nowrap',
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-word',
+      overflowWrap: 'anywhere',
       pointerEvents: 'none',
       userSelect: 'none',
+    }
+
+    /** `next` has no draft under it, so the whole block can mask the empty composer's placeholder. */
+    const NEXT_GHOST_STYLE = {
+      ...GHOST_BASE_STYLE,
+      background: 'var(--dsw-specific-input-major)',
       zIndex: 2,
     }
 
-    /** The continuation ghost hugs its text and sits where the caret is. */
+    /** `continue` starts at the caret; only the text itself is masked, never the draft before it. */
     const CONTINUE_GHOST_STYLE = {
-      ...NEXT_GHOST_STYLE,
-      gap: '6px',
-      padding: '0 4px',
-      borderRadius: '4px',
+      ...GHOST_BASE_STYLE,
       zIndex: 3,
     }
 
     const TEXT_STYLE = {
-      flex: '1 1 auto',
-      minWidth: 0,
-      overflow: 'hidden',
-      textOverflow: 'ellipsis',
-      whiteSpace: 'nowrap',
       opacity: 0.9,
     }
 
     const CONTINUE_TEXT_STYLE = {
       ...TEXT_STYLE,
-      flex: '0 1 auto',
+      background: 'var(--dsw-specific-input-major)',
+      boxDecorationBreak: 'clone',
+      WebkitBoxDecorationBreak: 'clone',
     }
 
+    /** Most extra height, in px, the ghost may ask the composer to make room for. */
+    const MAX_RESERVE = 240
+
     const KEYCAP_STYLE = {
-      flex: 'none',
+      display: 'inline-block',
+      verticalAlign: 'middle',
+      marginLeft: '6px',
+      // text-indent is inherited, and an inline-block applies it to its own first line.
+      textIndent: 0,
+      whiteSpace: 'nowrap',
       fontSize: '11px',
       lineHeight: '16px',
       padding: '0 5px',
       borderRadius: '4px',
       border: '1px solid var(--dsw-alias-border-l2)',
       color: 'var(--dsw-alias-label-tertiary)',
-      background: 'transparent',
+      background: 'var(--dsw-specific-input-major)',
     }
 
     const BADGE_STYLE = {
-      flex: 'none',
+      display: 'inline-block',
+      verticalAlign: 'middle',
+      marginLeft: '6px',
+      textIndent: 0,
+      whiteSpace: 'nowrap',
       fontSize: '10px',
       lineHeight: '14px',
       color: 'var(--dsw-alias-label-tertiary)',
+      background: 'var(--dsw-specific-input-major)',
       opacity: 0.8,
     }
 
@@ -472,6 +488,21 @@ window.__ModuleLoader__.load({
       return /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/u.test(character)
     }
 
+    /** The editor's type settings, so the ghost is set exactly like the draft it continues. */
+    function typographyOf(computed) {
+      const pick = (value) => (typeof value === 'string' && value !== '' && value !== 'normal' ? value : undefined)
+      const lineHeight = Number.parseFloat(computed.lineHeight)
+      const font = {
+        fontFamily: pick(computed.fontFamily),
+        fontSize: pick(computed.fontSize),
+        fontWeight: pick(computed.fontWeight),
+        letterSpacing: pick(computed.letterSpacing),
+        lineHeight: Number.isFinite(lineHeight) && lineHeight > 0 ? `${lineHeight}px` : undefined,
+      }
+      for (const key of Object.keys(font)) if (font[key] === undefined) delete font[key]
+      return font
+    }
+
     function sameBox(left, right) {
       return (
         left !== null &&
@@ -480,7 +511,10 @@ window.__ModuleLoader__.load({
         left.left === right.left &&
         left.height === right.height &&
         left.right === right.right &&
-        left.maxWidth === right.maxWidth
+        left.maxWidth === right.maxWidth &&
+        left.columnLeft === right.columnLeft &&
+        left.lineBreak === right.lineBreak &&
+        left.typo === right.typo
       )
     }
 
@@ -556,6 +590,8 @@ window.__ModuleLoader__.load({
       const [ghost, setGhost] = React.useState(NO_GHOST)
       const [box, setBox] = React.useState(null)
       const [compositionEnd, setCompositionEnd] = React.useState(0)
+      // Extra height, in px, the wrapped ghost needs below the editor; the toolbar row is pushed down by it.
+      const [reserve, setReserve] = React.useState(0)
 
       const anchorRef = React.useRef(null)
       const elements = () => composerElementsNear(anchorRef.current)
@@ -564,6 +600,7 @@ window.__ModuleLoader__.load({
       const dismissedRef = React.useRef(null)
       const acceptRef = React.useRef(null)
       const cycleRef = React.useRef(null)
+      const ghostNodeRef = React.useRef(null)
       const ghostRef = React.useRef(NO_GHOST)
       const visibleRef = React.useRef(false)
       const currentRef = React.useRef('')
@@ -834,10 +871,18 @@ window.__ModuleLoader__.load({
           const paddingLeft = Number.parseFloat(computed.paddingLeft)
           const topInset = Number.isFinite(paddingTop) ? paddingTop : EDITOR_INSET_TOP
           const leftInset = Number.isFinite(paddingLeft) ? paddingLeft : EDITOR_INSET_LEFT
+          // The text column ends at the editor's right padding, which is where accepted text wraps.
+          const paddingRight = Number.parseFloat(computed.paddingRight)
+          const rightInset = Number.isFinite(paddingRight) ? paddingRight : EDITOR_INSET_RIGHT
+          const font = typographyOf(computed)
           const next = {
+            font,
+            typo: JSON.stringify(font),
             top: Math.max(0, Math.round(editorRect.top - cardRect.top + topInset)),
             left: Math.max(0, Math.round(editorRect.left - cardRect.left + leftInset)),
-            right: Math.max(EDITOR_INSET_RIGHT, Math.round(cardRect.right - editorRect.right + EDITOR_SCROLL_MARGIN)),
+            right: Number.isFinite(editorRect.right)
+              ? Math.max(EDITOR_INSET_RIGHT, Math.round(cardRect.right - editorRect.right + rightInset))
+              : EDITOR_INSET_RIGHT + EDITOR_SCROLL_MARGIN,
             height: Number.isFinite(lineHeight) && lineHeight > 0 ? Math.round(lineHeight) : FALLBACK_LINE_HEIGHT,
           }
           setBox((previous) => (sameBox(previous, next) ? previous : next))
@@ -881,30 +926,41 @@ window.__ModuleLoader__.load({
           const cardRect = found.card.getBoundingClientRect()
           const computed = window.getComputedStyle(found.editor)
           const lineHeight = Number.parseFloat(computed.lineHeight)
-          const height =
-            Number.isFinite(caret.height) && caret.height > 0
-              ? Math.round(caret.height)
-              : Number.isFinite(lineHeight) && lineHeight > 0
-                ? Math.round(lineHeight)
-                : FALLBACK_LINE_HEIGHT
+          // The caret rectangle is the glyph box; the draft's line box is taller by the line spacing.
+          // The ghost's own first line box must land on the draft's, so half the difference moves up.
+          const lineBox = Number.isFinite(lineHeight) && lineHeight > 0 ? lineHeight : FALLBACK_LINE_HEIGHT
+          const glyphBox = Number.isFinite(caret.height) && caret.height > 0 ? caret.height : lineBox
+          const height = Math.round(lineBox)
+          const font = typographyOf(computed)
           const desired = caret.left - cardRect.left
           const left = Math.max(0, desired)
           const maxWidth = cardRect.right - (cardRect.left + left) - 16
-          if (maxWidth < 48) {
-            setBox((previous) => (previous === null ? previous : null))
-            return
-          }
-          const top = caret.top - cardRect.top
+          // Almost no room after the caret: the continuation starts on the next line instead.
+          const lineBreak = maxWidth < 48
+          const paddingLeft = Number.parseFloat(computed.paddingLeft)
+          const paddingRight = Number.parseFloat(computed.paddingRight)
+          const columnLeft = Number.isFinite(editorRect.left)
+            ? Math.max(0, Math.round(editorRect.left - cardRect.left + (Number.isFinite(paddingLeft) ? paddingLeft : EDITOR_INSET_LEFT)))
+            : EDITOR_INSET_LEFT
+          const columnRight = Number.isFinite(editorRect.right)
+            ? Math.max(EDITOR_INSET_RIGHT, Math.round(cardRect.right - editorRect.right + (Number.isFinite(paddingRight) ? paddingRight : EDITOR_INSET_RIGHT)))
+            : EDITOR_INSET_RIGHT + EDITOR_SCROLL_MARGIN
+          const top = caret.top - cardRect.top - (lineBox - glyphBox) / 2
           // A caret scrolled above or below the card has no honest place to draw.
           if (top < 0 || top > cardRect.height - 8) {
             setBox((previous) => (previous === null ? previous : null))
             return
           }
           const next = {
+            font,
+            typo: JSON.stringify(font),
             top: Math.round(top),
             left: Math.round(left),
             maxWidth: Math.round(maxWidth),
             height,
+            columnLeft,
+            right: columnRight,
+            lineBreak,
           }
           setBox((previous) => (sameBox(previous, next) ? previous : next))
         }
@@ -1009,6 +1065,35 @@ window.__ModuleLoader__.load({
         return () => document.removeEventListener('keydown', onKeyDown, true)
       }, [visible, draft, sessionId, ghost.items.length, ghost.active, ghost.mode, ghost.seq])
 
+      // How far the wrapped ghost reaches below the Host's scroll element, which holds the editor.
+      // The Host's own attribute names it; without it nothing is reserved and the toolbar may be covered.
+      React.useLayoutEffect(() => {
+        const node = ghostNodeRef.current
+        let next = 0
+        if (visible && node !== null && node !== undefined) {
+          const found = elements()
+          const scroll = found === null ? null : found.editor.closest('[data-input-scroll]')
+          if (scroll !== null && scroll !== undefined) {
+            const overflow = node.getBoundingClientRect().bottom - scroll.getBoundingClientRect().bottom
+            next = overflow > 0 ? Math.min(Math.ceil(overflow), MAX_RESERVE) : 0
+          }
+        }
+        setReserve((previous) => (previous === next ? previous : next))
+      }, [visible, box, current, hasNotice, pending, ghost.index, ghost.stream])
+
+      // Push the toolbar down by that much while the ghost is there, and put it back afterwards.
+      React.useLayoutEffect(() => {
+        if (reserve <= 0) return undefined
+        const found = elements()
+        const scroll = found === null ? null : found.editor.closest('[data-input-scroll]')
+        if (scroll === null || scroll === undefined) return undefined
+        const previous = scroll.style.marginBottom
+        scroll.style.marginBottom = `${reserve}px`
+        return () => {
+          scroll.style.marginBottom = previous
+        }
+      }, [reserve])
+
       const anchor = h('span', {
         ref: anchorRef,
         'data-composer-suggest-anchor': '',
@@ -1019,25 +1104,36 @@ window.__ModuleLoader__.load({
       if (!visible || box === null) return anchor
 
       const continuation = ghost.mode === 'continue'
-      const style = continuation ? CONTINUE_GHOST_STYLE : NEXT_GHOST_STYLE
       const textStyle = continuation ? CONTINUE_TEXT_STYLE : TEXT_STYLE
-      const room = box.maxWidth ?? 0
       const noticeText = hasNotice ? t(ghost.notice.key).replace('{reason}', ghost.notice.reason ?? '') : ''
       const failed = hasNotice && ghost.notice.reason !== undefined
       const spinner = h('span', { className: 'cs-spin', 'aria-hidden': 'true' })
+
+      // The block spans the editor's text column and wraps there. A continuation's first line is
+      // indented to the caret; with no room left on that line it starts on the next one.
+      const columnLeft = box.columnLeft ?? EDITOR_INSET_LEFT
+      const columnRight = box.right ?? EDITOR_INSET_RIGHT + EDITOR_SCROLL_MARGIN
+      const placement = continuation
+        ? {
+            top: box.top + (box.lineBreak === true ? box.height : 0),
+            left: columnLeft,
+            right: columnRight,
+            textIndent: box.lineBreak === true ? 0 : Math.max(0, box.left - columnLeft),
+          }
+        : { top: box.top, left: box.left, right: columnRight, minHeight: box.height }
 
       let content
       if (hasNotice) {
         content = [h('span', { style: failed ? { ...textStyle, color: 'var(--dsw-alias-state-error-primary)' } : textStyle }, noticeText)]
       } else if (current === '') {
         // The model is working and has not produced text yet.
-        content = [spinner, h('span', { style: textStyle }, t('pending')), room >= 140 ? h('kbd', { style: KEYCAP_STYLE, title: t('cancel') }, 'Esc') : null]
+        content = [spinner, h('span', { style: textStyle }, t('pending')), h('kbd', { style: KEYCAP_STYLE, title: t('cancel') }, 'Esc')]
       } else {
         content = [
           h('span', { style: textStyle }, current),
           pending ? spinner : null,
           ghost.items.length > 1 ? h('span', { style: BADGE_STYLE, title: t('more') }, `${ghost.index + 1}/${ghost.items.length}`) : null,
-          !ghost.active && (!continuation || room >= 96) ? h('kbd', { style: KEYCAP_STYLE, title: t('accept') }, 'Tab') : null,
+          !ghost.active ? h('kbd', { style: KEYCAP_STYLE, title: t('accept') }, 'Tab') : null,
         ]
       }
       const announcement = hasNotice
@@ -1050,7 +1146,8 @@ window.__ModuleLoader__.load({
         h('span', { role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true', style: { position: 'absolute', width: 1, height: 1, padding: 0, margin: -1, overflow: 'hidden', clipPath: 'inset(50%)', whiteSpace: 'nowrap' } }, announcement),
         h('div',
           {
-            style: { ...style, ...box },
+            ref: ghostNodeRef,
+            style: { ...(continuation ? CONTINUE_GHOST_STYLE : NEXT_GHOST_STYLE), ...(box.font ?? {}), ...placement },
             'aria-hidden': 'true',
             'data-composer-suggest': ghost.mode,
             'data-composer-ghost': 'dsh-composer-suggest',

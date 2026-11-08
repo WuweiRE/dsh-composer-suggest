@@ -76,9 +76,11 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
   const fetchCalls = []
   const registered = {}
   const dictionaries = {}
-  const view = { draft: '', prefix: undefined, tail: '', caretOffset: 100, width: 600, insert: true, focusInEditor: true }
+  const view = { draft: '', prefix: undefined, tail: '', caretOffset: 100, width: 600, insert: true, focusInEditor: true, scrollBottom: 100, ghostBottom: 0, hasScroll: true, caretHeight: 24, computed: { lineHeight: '24px' } }
 
-  const editor = { contains: (node) => (node === document.activeElement ? view.focusInEditor : true), getBoundingClientRect: () => ({ width: view.width, height: 100 }) }
+  // The Host wraps the editor in a scroll element (data-input-scroll); a margin set on it moves the toolbar.
+  const scroll = { style: { marginBottom: '' }, getBoundingClientRect: () => ({ bottom: view.scrollBottom }) }
+  const editor = { closest: (selector) => (selector === '[data-input-scroll]' && view.hasScroll ? scroll : null), contains: (node) => (node === document.activeElement ? view.focusInEditor : true), getBoundingClientRect: () => ({ width: view.width, height: 100 }) }
   const card = {
     contains: () => true,
     querySelector: () => editor,
@@ -116,10 +118,10 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
         collapsed: true,
         startContainer: {},
         startOffset: view.draft.length,
-        getBoundingClientRect: () => ({ left: view.caretOffset, top: 10, width: 0, height: 24 }),
+        getBoundingClientRect: () => ({ left: view.caretOffset, top: 10, width: 0, height: view.caretHeight }),
       }),
     }),
-    getComputedStyle: () => ({ lineHeight: '24px' }),
+    getComputedStyle: () => view.computed,
     addEventListener: (name, fn) => windowListeners.set(name, fn),
     removeEventListener() {},
   }
@@ -130,6 +132,8 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
       // React assigns refs before effects; the harness does the same so the
       // overlay can locate the composer card that owns it.
       if (props && props.ref && typeof props.ref === 'object') props.ref.current = element
+      // A real DOM node can always be measured: the ghost reaches down to view.ghostBottom.
+      if (props && props['data-composer-ghost'] !== undefined) element.getBoundingClientRect = () => ({ bottom: view.ghostBottom })
       if (props && props['data-composer-suggest-anchor'] !== undefined) {
         element.isConnected = true
         element.closest = (selector) => (selector === '[data-composer-card]' ? card : null)
@@ -200,7 +204,7 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
     setDraft: () => { throw new Error('Must never replace the draft') },
   }
 
-  function render({ draft = '', ghost, box, running = false } = {}) {
+  function render({ draft = '', ghost, box, running = false, reserve = 0 } = {}) {
     view.draft = draft
     index = 0
     refIndex = 0
@@ -214,6 +218,7 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
       { mode, items: [], index: 0, stream: '', active: false, seq: null, notice: null, ...ghost },
       box === undefined ? { left: 100, top: 10, maxWidth: 400, height: 24 } : box,
       0,
+      reserve,
     ]
     const wrapper = registered['conversation.input.overlay'].component({
       sessionId: 's1',
@@ -225,7 +230,7 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
     return { tree, state, effects, layouts, listeners, request, timers }
   }
 
-  return { module, registered, render, view, inserted, fetchCalls, warnings, windowListeners, localStorage, dictionaries, effects, layouts, listeners, timers }
+  return { module, registered, render, view, scroll, inserted, fetchCalls, warnings, windowListeners, localStorage, dictionaries, effects, layouts, listeners, timers }
 }
 
 function keyEvent(key, extra = {}) {
@@ -757,19 +762,24 @@ test('the ghost is shown only for an enabled mode', () => {
   assert.equal(continueOff.render({ draft: 'Can you', ghost: { mode: 'continue', items: [' x'] } }).tree.type, 'span', 'continuation ghost hidden')
 })
 
-test('the right edge hides the continuation ghost instead of moving it over the draft', () => {
+test('with no room left after the caret the continuation starts on the next line, never over the draft', () => {
   const edge = load()
   edge.view.caretOffset = 590
-  const hidden = edge.render({ draft: 'Can you also', ghost: { mode: 'continue', items: [' x'] } })
-  for (const layout of hidden.layouts) layout()
-  assert.equal(hidden.state[1], null)
+  const cramped = edge.render({ draft: 'Can you also', ghost: { mode: 'continue', items: [' x'] } })
+  for (const layout of cramped.layouts) layout()
+  assert.notEqual(cramped.state[1], null, 'it is still shown')
+  assert.equal(cramped.state[1].lineBreak, true)
+  const placed = edge.render({ draft: 'Can you also', ghost: { mode: 'continue', items: [' x'] }, box: cramped.state[1] }).tree.children[1].props.style
+  assert.equal(placed.top, cramped.state[1].top + cramped.state[1].height, 'one line below the caret line')
+  assert.equal(placed.textIndent, 0)
 
   const fits = load()
   fits.view.caretOffset = 400
-  const shown = fits.render({ draft: 'Can you also', ghost: { mode: 'continue', items: [' x'] } })
-  for (const layout of shown.layouts) layout()
-  assert.equal(shown.state[1].left, 400)
-  assert.equal(shown.state[1].maxWidth, 184)
+  const roomy = fits.render({ draft: 'Can you also', ghost: { mode: 'continue', items: [' x'] } })
+  for (const layout of roomy.layouts) layout()
+  assert.equal(roomy.state[1].left, 400)
+  assert.equal(roomy.state[1].maxWidth, 184)
+  assert.equal(roomy.state[1].lineBreak, false)
 })
 
 test('final suggestions are announced, previews are not, and the ghost carries the shared marker', () => {
@@ -825,6 +835,186 @@ test('a failed or empty continuation shows a short notice that clears itself', (
   rendered.state[0] = { mode: 'continue', items: [], index: 0, stream: '', active: false, seq: null, notice }
   timer.fn()
   assert.equal(rendered.state[0].notice, null)
+})
+
+// The ghost is a block that wraps at the editor's column, like the text it stands for.
+const ghostStyle = (tree) => tree.children[1].props.style
+
+test('a continuation wraps in place: it spans the text column and its first line starts at the caret', () => {
+  const app = load()
+  const ghost = { mode: 'continue', items: [' 把 README 里的用法示例也更新成带时区参数的写法，再补一个无效时区的测试'] }
+  const box = { top: 30, left: 420, maxWidth: 164, height: 24, columnLeft: 14, right: 12, lineBreak: false }
+  const style = ghostStyle(app.render({ draft: '理一下目前的流程', ghost, box }).tree)
+  assert.equal(style.position, 'absolute')
+  assert.equal(style.whiteSpace, 'pre-wrap', 'wraps like the editor')
+  assert.equal(style.overflowWrap, 'anywhere')
+  assert.equal(style.left, 14, 'wrapped lines return to the left edge of the text column')
+  assert.equal(style.right, 12)
+  assert.equal(style.top, 30)
+  assert.equal(style.textIndent, 406, 'the first line starts where the caret is')
+  assert.equal(style.overflow, undefined, 'never clipped')
+  assert.equal(style.textOverflow, undefined, 'no ellipsis')
+  assert.equal(style.background, undefined, 'the block does not hide the draft before the caret')
+})
+
+test('only the text itself masks what is behind a continuation, and it is the whole text, not a cut-off part', () => {
+  const app = load()
+  const long = ' 把 README 里的用法示例也更新成带时区参数的写法，再补一个无效时区的测试'
+  const tree = app.render({ draft: '理一下', ghost: { mode: 'continue', items: [long] } }).tree
+  const text = tree.children[1].children[0]
+  assert.equal(text.children[0], long)
+  assert.equal(text.props.style.background, 'var(--dsw-specific-input-major)')
+  assert.equal(text.props.style.boxDecorationBreak, 'clone', 'the mask follows every wrapped line')
+  assert.equal(text.props.style.textOverflow, undefined)
+})
+
+test('a next-message suggestion also wraps in the text column instead of being cut off', () => {
+  const app = load()
+  const long = 'Please run the full test suite, then compare the output against the previous run and tell me which tests changed'
+  const tree = app.render({ draft: '', ghost: { mode: 'next', items: [long] }, box: { top: 4, left: 14, right: 12, height: 24, maxWidth: 400 } }).tree
+  const style = ghostStyle(tree)
+  assert.equal(style.whiteSpace, 'pre-wrap')
+  assert.equal(style.left, 14)
+  assert.equal(style.right, 12)
+  assert.equal(style.minHeight, 24)
+  assert.equal(style.background, 'var(--dsw-specific-input-major)', 'covers the placeholder')
+  assert.equal(tree.children[1].children[0].children[0], long)
+})
+
+test('the first-line indent stays on the text: the count, the Tab hint and the spinner do not inherit it', () => {
+  const app = load()
+  const box = { top: 30, left: 420, maxWidth: 164, height: 24, columnLeft: 14, right: 12, lineBreak: false }
+  const tree = app.render({ draft: '理一下', ghost: { mode: 'continue', items: [' 更新一下', ' 再改一下'] }, box }).tree
+  const chip = tree.children[1]
+  assert.equal(chip.props.style.textIndent, 406, 'the block indents its first line to the caret')
+  const [, , badge, keycap] = chip.children
+  assert.equal(badge.props.style.textIndent, 0, 'text-indent is inherited, so the small pieces reset it')
+  assert.equal(keycap.props.style.textIndent, 0)
+  assert.equal(keycap.props.style.whiteSpace, 'nowrap', 'the Tab hint never splits over two lines')
+  assert.equal(badge.props.style.whiteSpace, 'nowrap')
+  const css = tree.children.find((child) => child && child.type === 'style').children[0]
+  assert.match(css, /\.cs-spin\{[^}]*text-indent:0/)
+})
+
+test('the ghost is set in the editor\'s own font, size and line spacing', () => {
+  const app = load()
+  app.view.computed = { lineHeight: '27.2px', fontSize: '17px', fontFamily: 'PingFang SC, sans-serif', fontWeight: '400', letterSpacing: '0.2px' }
+  const cont = app.render({ draft: '理一下', ghost: { mode: 'continue', items: [' 更新一下'] } })
+  for (const layout of cont.layouts) layout()
+  assert.deepEqual(JSON.parse(JSON.stringify(cont.state[1].font)), { fontFamily: 'PingFang SC, sans-serif', fontSize: '17px', fontWeight: '400', letterSpacing: '0.2px', lineHeight: '27.2px' })
+  const style = app.render({ draft: '理一下', ghost: { mode: 'continue', items: [' 更新一下'] }, box: cont.state[1] }).tree.children[1].props.style
+  assert.equal(style.fontSize, '17px')
+  assert.equal(style.lineHeight, '27.2px', 'wrapped lines are spaced exactly like the draft')
+  assert.equal(style.fontFamily, 'PingFang SC, sans-serif')
+  assert.equal(style.letterSpacing, '0.2px')
+
+  // `normal` and empty values are not copied: the ghost keeps inheriting those.
+  app.view.computed = { lineHeight: 'normal', fontSize: '', fontFamily: 'sans-serif', letterSpacing: 'normal' }
+  const plain = app.render({ draft: '', ghost: { mode: 'next', items: ['Run it again'] } })
+  for (const layout of plain.layouts) layout()
+  assert.deepEqual(JSON.parse(JSON.stringify(plain.state[1].font)), { fontFamily: 'sans-serif' })
+})
+
+test('the next-message ghost uses the editor\'s type settings too', () => {
+  const app = load()
+  app.view.computed = { lineHeight: '27px', fontSize: '17px' }
+  const rendered = app.render({ draft: '', ghost: { mode: 'next', items: ['Run it again'] } })
+  for (const layout of rendered.layouts) layout()
+  const style = app.render({ draft: '', ghost: { mode: 'next', items: ['Run it again'] }, box: rendered.state[1] }).tree.children[1].props.style
+  assert.equal(style.fontSize, '17px')
+  assert.equal(style.lineHeight, '27px')
+})
+
+test('the first line of a continuation sits on the draft\'s own line, not lower by the line spacing', () => {
+  // The caret rectangle is the glyph box (20px); the draft's line box is 28px tall. The ghost's
+  // first line is a 28px box too, so it must start 4px higher than the caret rectangle does.
+  const app = load()
+  app.view.caretHeight = 20
+  app.view.computed = { lineHeight: '28px' }
+  const rendered = app.render({ draft: '理一下', ghost: { mode: 'continue', items: [' 更新一下'] } })
+  for (const layout of rendered.layouts) layout()
+  assert.equal(rendered.state[1].top, 10 - 4)
+  assert.equal(rendered.state[1].height, 28, 'the line pitch is the editor\'s line height')
+
+  // When both are the same height nothing moves.
+  const same = load()
+  same.view.caretHeight = 24
+  same.view.computed = { lineHeight: '24px' }
+  const flat = same.render({ draft: '理一下', ghost: { mode: 'continue', items: [' 更新一下'] } })
+  for (const layout of flat.layouts) layout()
+  assert.equal(flat.state[1].top, 10)
+})
+
+test('the text, the candidate count and the Tab hint flow together after the text', () => {
+  const app = load()
+  const chip = app.render({ draft: 'Can you also', ghost: { mode: 'continue', items: [' run the tests', ' add a test'] } }).tree.children[1]
+  assert.deepEqual(chip.children.map((child) => child && (child.type === 'kbd' ? 'kbd' : child.type)), ['span', null, 'span', 'kbd'])
+  assert.equal(chip.children[3].props.style.display, 'inline-block')
+  assert.equal(chip.children[2].props.style.display, 'inline-block')
+})
+
+test('a ghost taller than the editor pushes the toolbar down by exactly the overflow, and gives it back', () => {
+  const app = load()
+  const ghost = { mode: 'continue', items: [' 一段很长很长的续写内容'] }
+  // The wrapped ghost reaches 160px; the Host's scroll element, which holds the editor, ends at 100px.
+  app.view.scrollBottom = 100
+  app.view.ghostBottom = 160
+  const shown = app.render({ draft: '理一下', ghost })
+  for (const layout of shown.layouts) layout()
+  assert.equal(shown.state[3], 60, 'the overflow is measured')
+
+  const pushed = app.render({ draft: '理一下', ghost, reserve: 60 })
+  for (const layout of pushed.layouts) layout()
+  assert.equal(app.scroll.style.marginBottom, '60px', 'the toolbar row is moved down')
+
+  const gone = app.render({ draft: '理一下', ghost, reserve: 0 })
+  for (const layout of gone.layouts) layout()
+  assert.equal(app.scroll.style.marginBottom, '', 'the margin is removed again')
+})
+
+test('a margin the Host already had is restored, not erased', () => {
+  const app = load()
+  app.scroll.style.marginBottom = '4px'
+  const ghost = { mode: 'continue', items: [' 更新一下'] }
+  const pushed = app.render({ draft: '顺便帮我', ghost, reserve: 40 })
+  for (const layout of pushed.layouts) layout()
+  assert.equal(app.scroll.style.marginBottom, '40px')
+  const gone = app.render({ draft: '顺便帮我', ghost, reserve: 0 })
+  for (const layout of gone.layouts) layout()
+  assert.equal(app.scroll.style.marginBottom, '4px')
+})
+
+test('nothing is reserved when the ghost fits, when it is hidden, or when the Host markup is not found', () => {
+  const ghost = { mode: 'continue', items: [' 更新一下'] }
+  const fit = load()
+  fit.view.scrollBottom = 100
+  fit.view.ghostBottom = 90
+  const a = fit.render({ draft: '顺便帮我', ghost })
+  for (const layout of a.layouts) layout()
+  assert.equal(a.state[3], 0, 'inside the editor: no space needed')
+
+  const missing = load()
+  missing.view.hasScroll = false
+  missing.view.ghostBottom = 400
+  const b = missing.render({ draft: '顺便帮我', ghost })
+  for (const layout of b.layouts) layout()
+  assert.equal(b.state[3], 0, 'without the Host element nothing is changed')
+  assert.equal(missing.scroll.style.marginBottom, '')
+
+  const hidden = load()
+  hidden.view.ghostBottom = 400
+  const c = hidden.render({ draft: '顺便帮我', ghost: { mode: 'continue', items: [] } })
+  for (const layout of c.layouts) layout()
+  assert.equal(c.state[3], 0, 'no suggestion: no space')
+})
+
+test('the reserved space is capped so a runaway suggestion cannot swallow the screen', () => {
+  const app = load()
+  app.view.scrollBottom = 100
+  app.view.ghostBottom = 5000
+  const shown = app.render({ draft: '理一下', ghost: { mode: 'continue', items: [' 很长'] } })
+  for (const layout of shown.layouts) layout()
+  assert.equal(shown.state[3], 240)
 })
 
 test('continuation joining only separates real words', () => {
