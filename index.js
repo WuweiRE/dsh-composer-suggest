@@ -516,6 +516,23 @@ function clip(text, maximum) {
   return text.length > maximum ? `${text.slice(0, maximum)}…` : text
 }
 
+/** Shortest piece, in characters, a packed line may be split into. */
+const MIN_PACKED_PIECE = 4
+
+/**
+ * Some models write every candidate on one line, separated only by a space, in
+ * languages that put no spaces inside a sentence ("把A改一下 把B也改一下"). Split such
+ * a line where a blank sits between two Chinese or Japanese characters, or after
+ * their sentence-final punctuation. Anything uncertain stays one candidate: Latin
+ * text, Korean (which spaces its words), and lines with a piece shorter than
+ * {@link MIN_PACKED_PIECE}.
+ */
+function unpackLine(raw) {
+  const pieces = raw.split(/(?<=[\u3040-\u30ff\u3400-\u9fff。！？；…])[ \t\u3000]+(?=[\u3040-\u30ff\u3400-\u9fff])/u)
+  if (pieces.length < 2) return [raw]
+  return pieces.every((piece) => piece.trim().length >= MIN_PACKED_PIECE) ? pieces : [raw]
+}
+
 /** Split model output into clean, de-duplicated, bounded candidates. */
 function normalizeCandidates(text, maximum, draft, cue = '') {
   const items = []
@@ -524,7 +541,7 @@ function normalizeCandidates(text, maximum, draft, cue = '') {
   const prefixLower = prefix.toLocaleLowerCase()
   const cueIdentity = identityOf(cue)
 
-  for (const raw of text.split(/\r?\n/)) {
+  for (const raw of text.split(/\r?\n/).flatMap((line) => unpackLine(line))) {
     // Keep whether the line began with whitespace: for a continuation the model
     // uses a leading space to say "the draft needs a separator here".
     const hadLeadingSpace = /^\s/u.test(raw)

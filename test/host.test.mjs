@@ -560,6 +560,63 @@ test('option bounds fall back to defaults for invalid values', () => {
   assert.equal(resolveOptions({ model: ' claude-sonnet-5-5 ' }).model, 'claude-sonnet-5-5')
 })
 
+test('candidates a model packs onto one line are split apart (real deepseek-flash replies)', () => {
+  const { normalizeCandidates } = __testing
+  // Both strings were returned by deepseek-flash for the same prompt: one line, three candidates.
+  assert.deepEqual(
+    normalizeCandidates('把 README 里的用法示例也更新一下 把 README 里的示例改成带时区参数的写法 更新一下 README 里的旧示例吧', 3, '', ''),
+    ['把 README 里的用法示例也更新一下', '把 README 里的示例改成带时区参数的写法', '更新一下 README 里的旧示例吧'],
+  )
+  assert.deepEqual(
+    normalizeCandidates('把 README 里的用法示例也更新成新签名 再看看有没有其他地方调用 formatDate', 3, '', ''),
+    ['把 README 里的用法示例也更新成新签名', '再看看有没有其他地方调用 formatDate'],
+  )
+})
+
+test('a packed line respects the candidate limit, drops duplicates and ends at sentence punctuation too', () => {
+  const { normalizeCandidates } = __testing
+  assert.deepEqual(normalizeCandidates('先跑一遍测试 再提交代码 然后发布新版本 最后写更新日志', 2, '', ''), ['先跑一遍测试', '再提交代码'])
+  assert.deepEqual(normalizeCandidates('先跑一遍测试 先跑一遍测试 再提交代码', 3, '', ''), ['先跑一遍测试', '再提交代码'])
+  assert.deepEqual(normalizeCandidates('先跑一遍测试。 再提交代码！\u3000然后发布新版本', 3, '', ''), ['先跑一遍测试。', '再提交代码！', '然后发布新版本'])
+})
+
+test('a packed continuation keeps the draft logic for its first piece only', () => {
+  const { normalizeCandidates } = __testing
+  assert.deepEqual(
+    normalizeCandidates(' 三条待办事项 一封正式的邮件 简短的群通知', 3, '把上面的结论改写成', ''),
+    [' 三条待办事项', '一封正式的邮件', '简短的群通知'],
+  )
+  assert.deepEqual(
+    normalizeCandidates('把上面的结论改写成三条待办事项 把上面的结论改写成一封正式的邮件', 3, '把上面的结论改写成', ''),
+    ['三条待办事项', '一封正式的邮件'],
+  )
+})
+
+test('lines that only look packed stay one candidate', () => {
+  const { normalizeCandidates } = __testing
+  // Latin text, and Chinese mixed with Latin words, have spaces inside a sentence.
+  assert.deepEqual(normalizeCandidates('Run the full test suite and then commit the fixture change', 3, '', ''), ['Run the full test suite and then commit the fixture change'])
+  assert.deepEqual(normalizeCandidates('把 README 里的 formatDate 示例更新一下', 3, '', ''), ['把 README 里的 formatDate 示例更新一下'])
+  // Korean puts spaces between words.
+  assert.deepEqual(normalizeCandidates('파일을 수정해 주세요', 3, '', ''), ['파일을 수정해 주세요'])
+  // A piece shorter than four characters means the split is not trusted.
+  assert.deepEqual(normalizeCandidates('先跑一遍测试 好的 再提交代码', 3, '', ''), ['先跑一遍测试 好的 再提交代码'])
+})
+
+test('lines that were already separate are untouched, and a packed line mixes with them', () => {
+  const { normalizeCandidates } = __testing
+  assert.deepEqual(normalizeCandidates('先跑一遍测试\n再提交代码\n然后发布新版本', 3, '', ''), ['先跑一遍测试', '再提交代码', '然后发布新版本'])
+  assert.deepEqual(normalizeCandidates('先跑一遍测试 再提交代码\n然后发布新版本', 3, '', ''), ['先跑一遍测试', '再提交代码', '然后发布新版本'])
+})
+
+test('a reply with all candidates on one line reaches the Client as separate items', async () => {
+  const harness = makeHarness({ reply: '把 README 里的用法示例也更新一下 把 README 里的示例改成带时区参数的写法 更新一下 README 里的旧示例吧' })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const done = sseEvents(await callRoute(harness, { sessionId: 's1' })).at(-1)
+  assert.equal(done.type, 'done')
+  assert.deepEqual(done.items, ['把 README 里的用法示例也更新一下', '把 README 里的示例改成带时区参数的写法', '更新一下 README 里的旧示例吧'])
+})
+
 test('candidates are bounded, de-duplicated and stripped of list markers', () => {
   const { normalizeCandidates } = __testing
   const items = normalizeCandidates('1. Do it\n2) do it\n* Another\nUser: third\n' + 'w '.repeat(200), 5, '', '')
