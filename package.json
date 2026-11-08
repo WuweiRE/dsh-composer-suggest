@@ -1,0 +1,62 @@
+{
+  "name": "dsh-composer-suggest",
+  "version": "0.1.0",
+  "description": "Composer suggestions for the DeepSeek Harness Web UI: next-message ghost text after a reply plus Tab-triggered draft continuation, answered by the Session's own model or a model you pin.",
+  "author": "WuweiRE",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "composer",
+    "autocomplete",
+    "tab-completion"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WuweiRE/dsh-composer-suggest.git"
+  },
+  "bugs": {
+    "url": "https://github.com/WuweiRE/dsh-composer-suggest/issues"
+  },
+  "homepage": "https://github.com/WuweiRE/dsh-composer-suggest#readme",
+  "scripts": {
+    "test": "node --test"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "LICENSE.stijnus",
+    "LICENSE.bazylkhanov",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

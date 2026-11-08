@@ -1,0 +1,23 @@
+# Composer suggestions: after a turn ends the Host streams follow-up messages;
+# when you press Tab at the end of a draft it streams continuations of that draft.
+# The Client renders ghost text and accepts it on Tab (Alt+Down cycles candidates).
+- insert:
+    - id: composer-suggest
+      name: dsh-composer-suggest
+      config:
+        # Empty: suggestions are answered by the model the Session already uses.
+        # Name a model id to pin it instead, e.g. `model: claude-sonnet-5-5`. Without a
+        # `provider` it is looked up among the providers mounted in this profile (the
+        # Session's provider first); with both set the route is used exactly as given.
+        model: ''
+        # provider: claude2
+        # Lowest effort keeps latency and cost down; falls back to the model's first
+        # advertised effort when "low" is not offered. Sonnet takes no temperature.
+        reasoningEffort: low
+        maxOutputTokens: 1024
+        timeoutMs: 30000
+        maxSuggestions: 3
+        # Prompt for both modes: transcript tail and recent tool calls.
+        maxMessages: 10
+        maxChars: 8000
+        maxToolNotes: 6

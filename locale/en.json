@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Composer suggestions",
+    "description": "Ghost-text suggestions in the composer: your likely next message after a reply, and a continuation of your draft when you press Tab at its end. Tab accepts, Alt+Down cycles candidates. Answered by the Session's own model, or by a model you pin in the configuration."
+  }
+}
