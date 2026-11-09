@@ -231,7 +231,10 @@ async function planRequest(ctx, baseOptions, request, response) {
   const asked = typeof body.model === 'string' ? body.model.trim() : ''
   const askedProvider = typeof body.provider === 'string' ? body.provider.trim() : ''
   if (asked.length > 200 || askedProvider.length > 200) return { status: 400, error: 'invalid-model' }
-  const options = asked === '' ? baseOptions : { ...baseOptions, model: asked, provider: askedProvider }
+  // Naming the model the configuration already pins keeps its provider (and so its credential);
+  // any other model is looked up, or taken with the provider the request names.
+  const sameRoute = asked === baseOptions.model && (askedProvider === '' || askedProvider === baseOptions.provider)
+  const options = asked === '' || sameRoute ? baseOptions : { ...baseOptions, model: asked, provider: askedProvider }
 
   const seq = Number(session.seq)
   const key = JSON.stringify([sessionId, seq, mode, draft, options.provider, options.model])

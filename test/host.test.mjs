@@ -317,6 +317,27 @@ test('a provider named with the model is used as given, and a blank model falls 
   assert.equal(harness.llmCalls[1].config.provider, 'claude2', 'blank model: the Session route, the provider is ignored')
 })
 
+test('naming the configured model in Settings keeps the configured provider', async () => {
+  const harness = makeHarness({ reply: 'go', config: { provider: 'claude-suggest', model: 'claude-sonnet-5-5' } })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  await callRoute(harness, { sessionId: 's1' })
+  await callRoute(harness, { sessionId: 's1', model: 'claude-sonnet-5-5' })
+  assert.equal(harness.llmCalls.length, 1, 'the same route is served from the cache')
+  assert.equal(harness.llmCalls[0].config.provider, 'claude-suggest')
+
+  const session = harness.sessions.get('s1')
+  session.seq = 2
+  await callRoute(harness, { sessionId: 's1', model: 'claude-sonnet-5-5', provider: 'claude-suggest' })
+  assert.equal(harness.llmCalls[1].config.provider, 'claude-suggest')
+  assert.equal(harness.listCalls.length, 0, 'no catalog lookup: the pair is used as configured')
+
+  // A different model is not tied to the configured provider.
+  session.seq = 3
+  await callRoute(harness, { sessionId: 's1', model: 'claude-opus-5-5' })
+  assert.notEqual(harness.llmCalls[2].config.provider, 'claude-suggest')
+  assert.equal(harness.llmCalls[2].config.model, 'claude-opus-5-5')
+})
+
 test('the result cache keeps models apart', async () => {
   const harness = makeHarness({ reply: 'go' })
   harness.sessions.set('s1', makeSession(CONVERSATION))
