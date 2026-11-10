@@ -39,7 +39,9 @@ git clone https://github.com/WuweiRE/dsh-composer-suggest.git
 dsh plugin --profile <name> add ./dsh-composer-suggest
 ```
 
-From npm, once a release is published there:
+Not yet published to npm. The registry has no `dsh-composer-suggest` package yet
+(`npm view dsh-composer-suggest` returns 404), so install from the checkout above. This
+paragraph becomes the one-line registry install once the first release is published:
 
 ```sh
 dsh plugin --profile <name> add dsh-composer-suggest
