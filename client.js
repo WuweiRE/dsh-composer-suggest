@@ -76,6 +76,11 @@ window.__ModuleLoader__.load({
     const NOTICE_MS = 2600
     /** The Host bounds the draft too; this keeps the request body small. */
     const MAX_DRAFT_CHARS = 4_000
+    /** At most this many composer images ride along with a continuation. */
+    const MAX_IMAGES = 3
+    const MAX_IMAGE_EDGE = 1024
+    const MAX_IMAGE_BYTES = 800_000
+    const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
     /** Ignore the first characters of a streaming answer to avoid flicker. */
     const STREAM_MIN_CHARS = 3
 
@@ -99,18 +104,22 @@ window.__ModuleLoader__.load({
         next: 'Suggest my next message',
         nextHint: 'After a reply, show the message you are most likely to send next.',
         continue: 'Continue my draft with Tab',
-        continueHint: 'With text in the composer and the caret at its end, press Tab. The model continues it using the conversation above; press Tab again to accept. Nothing is asked until you press Tab, and Tab keeps its usual job anywhere else.',
+        continueHint: 'With text at the caret, or with an attached image, press Tab. The model continues from the conversation, the draft, and those images; press Tab again to accept. Nothing is asked until you press Tab.',
         model: 'Model for suggestions',
         modelHint: 'Leave empty to use the current session\'s model, or enter a model id such as claude-sonnet-5-5 to use that one instead. If no provider offers it, the status line below says so.',
         modelPlaceholder: 'Same as the session',
-        cost: 'Every suggestion is a model call and uses tokens. Saved in this browser on this device.',
+        cost: 'Every suggestion is a model call and uses tokens. Images attached to a continuation are sent with it. Saved in this browser on this device.',
         pending: 'Continuing…',
         statusIdle: 'No suggestion requested yet.',
         statusOk: 'Last suggestion: {route} · {ms} ms',
         statusCached: 'Last suggestion: {route} · cached',
         statusError: 'Last suggestion failed: {reason}',
+        statusNoVision: 'The model could not see the attached images.',
         noteEmpty: 'The model had nothing to suggest.',
         noticeFailed: 'Continuation failed: {reason}',
+        imagesUnread: 'Could not read the attached images.',
+        imagesUnseen: 'This model cannot see images; type some text to continue.',
+        imagesUnavailable: 'The images could not be sent to the model.',
         ready: 'Suggestion: {text}. Press Tab to accept. Alt+Down or Alt+Up changes candidates. Escape dismisses.',
       },
       zh: {
@@ -121,18 +130,22 @@ window.__ModuleLoader__.load({
         next: '建议下一条消息',
         nextHint: '回复结束后，显示你最可能接着发送的消息。',
         continue: '用 Tab 续写我的草稿',
-        continueHint: '输入框里有内容且光标在末尾时按 Tab，模型会结合上面的对话续写，再按一次 Tab 采纳。不按 Tab 就不会请求模型，其他情况下 Tab 照常使用。',
+        continueHint: '输入框里有文字且光标在末尾，或附上了图片时，按 Tab。模型会结合对话、草稿和这些图片续写，再按一次 Tab 采纳。不按 Tab 就不会请求模型。',
         model: '建议使用的模型',
         modelHint: '留空则使用当前会话的模型；填写模型 ID（如 claude-sonnet-5-5）则改用该模型。找不到时，下方状态行会提示。',
         modelPlaceholder: '与会话相同',
-        cost: '每次建议都会调用一次模型并消耗 token。设置保存在当前设备的浏览器中。',
+        cost: '每次建议都会调用一次模型并消耗 token。续写时会把附上的图片一并发送。设置保存在当前设备的浏览器中。',
         pending: '正在续写…',
         statusIdle: '尚未请求过建议。',
         statusOk: '上次建议：{route} · {ms} ms',
         statusCached: '上次建议：{route} · 命中缓存',
         statusError: '上次建议失败：{reason}',
+        statusNoVision: '模型看不到附上的图片。',
         noteEmpty: '模型没有给出建议。',
         noticeFailed: '续写失败：{reason}',
+        imagesUnread: '无法读取附上的图片。',
+        imagesUnseen: '当前模型看不到图片，请先输入文字再续写。',
+        imagesUnavailable: '图片未能发给模型。',
         ready: '建议：{text}。按 Tab 采纳，Alt+↓ 或 Alt+↑ 切换，Escape 关闭。',
       },
     }
@@ -209,8 +222,10 @@ window.__ModuleLoader__.load({
       let color = 'var(--dsw-alias-label-secondary)'
       if (current.state === 'ok') {
         text = t('statusOk').replace('{route}', current.route).replace('{ms}', String(current.ms))
+        if (current.images === 'skipped' || current.images === 'unavailable' || current.images === 'refused') text = text + ' ' + t('statusNoVision')
       } else if (current.state === 'cached') {
         text = t('statusCached').replace('{route}', current.route)
+        if (current.images === 'skipped' || current.images === 'unavailable' || current.images === 'refused') text = text + ' ' + t('statusNoVision')
       } else if (current.state === 'note') {
         text = t(current.key)
       } else if (current.state === 'error') {
@@ -445,6 +460,94 @@ window.__ModuleLoader__.load({
       return /(?:^|\s)\/[^\s]*$/u.test(draft) || /(?:^|\s)@"?[^\s]*$/u.test(draft)
     }
 
+    /**
+     * Images currently shown in this composer card. The Host's attachment rail
+     * renders each pasted picture as an <img> whose src is a blob: (or data:) URL.
+     * Avatars and the ghost itself are outside that rail; we still skip anything
+     * inside the ghost, and ignore ordinary https: sources.
+     */
+    function collectComposerImages(card) {
+      if (card === null || card === undefined || typeof card.querySelectorAll !== 'function') return []
+      const seen = new Set()
+      const images = []
+      for (const node of card.querySelectorAll('img')) {
+        if (images.length >= MAX_IMAGES) break
+        if (typeof node.closest === 'function' && node.closest('[data-composer-ghost]') !== null) continue
+        const src = typeof node.src === 'string' ? node.src : ''
+        if (src === '' || seen.has(src)) continue
+        if (!src.startsWith('blob:') && !src.startsWith('data:image/')) continue
+        if (src.startsWith('data:image/svg')) continue
+        seen.add(src)
+        const name = typeof node.alt === 'string' ? node.alt.slice(0, 80) : ''
+        images.push(name === '' ? { src } : { src, name })
+      }
+      return images
+    }
+
+    function dataUrlParts(url) {
+      const match = /^data:([^;,]+)(?:;charset=[^;,]+)?;base64,(.+)$/u.exec(url)
+      if (match === null) return null
+      const mediaType = match[1] === 'image/jpg' ? 'image/jpeg' : match[1]
+      if (!IMAGE_TYPES.has(mediaType)) return null
+      const data = match[2].replace(/\s+/gu, '')
+      return data === '' ? null : { mediaType, data }
+    }
+
+    function blobToDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '')
+        reader.onerror = () => reject(reader.error ?? new Error('read-failed'))
+        reader.readAsDataURL(blob)
+      })
+    }
+
+    /** Fetch one composer thumbnail, shrink it, and return a JPEG the Host will accept. */
+    async function encodeComposerImage(source, signal) {
+      const response = await fetch(source.src, { signal })
+      if (!response.ok) return null
+      const blob = await response.blob()
+      if (signal?.aborted === true) return null
+      const named = (image) => (source.name ? { ...image, name: source.name } : image)
+      if (typeof createImageBitmap === 'function' && typeof document !== 'undefined' && typeof document.createElement === 'function') {
+        try {
+          const bitmap = await createImageBitmap(blob)
+          const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(bitmap.width, bitmap.height, 1))
+          const width = Math.max(1, Math.round(bitmap.width * scale))
+          const height = Math.max(1, Math.round(bitmap.height * scale))
+          const canvas = document.createElement('canvas')
+          canvas.width = width
+          canvas.height = height
+          const context = canvas.getContext('2d')
+          if (context !== null) {
+            context.fillStyle = '#fff'
+            context.fillRect(0, 0, width, height)
+            context.drawImage(bitmap, 0, 0, width, height)
+            if (typeof bitmap.close === 'function') bitmap.close()
+            if (typeof canvas.toDataURL === 'function') {
+              const parts = dataUrlParts(canvas.toDataURL('image/jpeg', 0.82))
+              if (parts !== null && Math.floor((parts.data.length * 3) / 4) <= MAX_IMAGE_BYTES) return named(parts)
+            }
+          }
+        } catch {
+          // The original bytes are tried next.
+        }
+      }
+      if (blob.size > MAX_IMAGE_BYTES) return null
+      const parts = dataUrlParts(await blobToDataUrl(blob))
+      return parts === null ? null : named(parts)
+    }
+
+    async function encodeComposerImages(sources, signal) {
+      const images = []
+      for (const source of sources.slice(0, MAX_IMAGES)) {
+        if (signal?.aborted === true) break
+        const encoded = await encodeComposerImage(source, signal)
+        if (encoded !== null) images.push(encoded)
+      }
+      return images
+    }
+
     /** Show the model's first line while it is still streaming. */
     function streamingCandidate(stream) {
       if (stream.trim().length < STREAM_MIN_CHARS) return ''
@@ -586,6 +689,9 @@ window.__ModuleLoader__.load({
       const nextEnabled = enabledPrefs.next
       const continueEnabled = enabledPrefs.continue
       const draft = useInput((state) => (state === undefined ? '' : state.draft || ''))
+      // A joined string, not a new array, so the selector stays referentially stable.
+      const attachmentIds = useInput((state) => (state === undefined || !Array.isArray(state.attachmentIds) ? '' : state.attachmentIds.join('\0')))
+      const hasAttachments = attachmentIds !== ''
       const running = useSessionStatus((state) => (state === undefined ? false : state.get(sessionId)?.running === true))
       const [ghost, setGhost] = React.useState(NO_GHOST)
       const [box, setBox] = React.useState(null)
@@ -606,7 +712,7 @@ window.__ModuleLoader__.load({
       const currentRef = React.useRef('')
 
       const request = React.useCallback(
-        async (mode, draftText) => {
+        async (mode, draftText, sources = []) => {
           if (sessionId === undefined || sessionId === null) return
           if (typeof document !== 'undefined' && document.hidden) return
           abortRef.current?.abort()
@@ -628,8 +734,15 @@ window.__ModuleLoader__.load({
               return { mode, items, index: 0, stream: '', active: false, seq: typeof seq === 'number' ? seq : null, notice: null }
             })
           }
+          const IMAGE_NOTES = { 'images-unread': 'imagesUnread', 'images-unseen': 'imagesUnseen', 'images-unavailable': 'imagesUnavailable' }
           const fail = (reason) => {
             if (controller.signal.aborted) return
+            const note = IMAGE_NOTES[reason]
+            if (note !== undefined) {
+              reportStatus({ state: 'note', key: note })
+              settle([], null, { key: note })
+              return
+            }
             reportStatus({ state: 'error', reason })
             settle([], null, { key: 'noticeFailed', reason })
           }
@@ -647,21 +760,32 @@ window.__ModuleLoader__.load({
               : []
             if (items.length > 0 && !controller.signal.aborted) {
               const route = describeRoute(event.route)
-              reportStatus(event.cached === true ? { state: 'cached', route } : { state: 'ok', route, ms: Number(event.ms) || 0 })
+              const images = typeof event.images === 'string' ? event.images : undefined
+              reportStatus(event.cached === true
+                ? { state: 'cached', route, ...(images === undefined ? {} : { images }) }
+                : { state: 'ok', route, ms: Number(event.ms) || 0, ...(images === undefined ? {} : { images }) })
             }
             settle(items, event.seq)
           }
 
           try {
+            let images = []
+            if (mode === 'continue' && sources.length > 0) {
+              images = await encodeComposerImages(sources, controller.signal)
+              if (controller.signal.aborted) return
+              if (images.length === 0 && draftText.trim() === '') {
+                fail('images-unread')
+                return
+              }
+            }
+            const payload = prefs.model === ''
+              ? { sessionId, mode, draft: draftText }
+              : { sessionId, mode, draft: draftText, model: prefs.model }
+            if (images.length > 0) payload.images = images
             const response = await fetch(ENDPOINT, {
               method: 'POST',
               headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
-              // A model typed in Settings wins over the Host configuration; empty means not set.
-              body: JSON.stringify(
-                prefs.model === ''
-                  ? { sessionId, mode, draft: draftText }
-                  : { sessionId, mode, draft: draftText, model: prefs.model },
-              ),
+              body: JSON.stringify(payload),
               signal: controller.signal,
             })
             if (controller.signal.aborted) return
@@ -756,6 +880,13 @@ window.__ModuleLoader__.load({
         }
       }, [draft])
 
+      // Adding or removing a picture is a new draft, even when the text did not change.
+      React.useEffect(() => {
+        abortRef.current?.abort()
+        setGhost(NO_GHOST)
+        dismissedRef.current = null
+      }, [attachmentIds])
+
       // A starting turn drops the ghost and re-arms a dismissed prediction.
       React.useEffect(() => {
         if (!running) return
@@ -767,14 +898,14 @@ window.__ModuleLoader__.load({
       // `next`: ask once the turn has settled and the composer is empty.
       React.useEffect(() => {
         if (sessionId === undefined || sessionId === null) return undefined
-        if (!nextEnabled || running || draft !== '') return undefined
+        if (!nextEnabled || running || draft !== '' || hasAttachments) return undefined
         if (dismissedRef.current !== null && dismissedRef.current.draft === draft) return undefined
         const timer = setTimeout(() => {
           if (composingRef.current) return
           void request('next', '')
         }, SETTLE_MS)
         return () => clearTimeout(timer)
-      }, [sessionId, running, draft, request, nextEnabled, compositionEnd])
+      }, [sessionId, running, draft, hasAttachments, request, nextEnabled, compositionEnd])
 
       // A short notice (nothing to continue, failure) clears itself.
       React.useEffect(() => {
@@ -807,12 +938,13 @@ window.__ModuleLoader__.load({
           }
           // A finished suggestion is accepted by the other handler.
           if (visibleRef.current && currentRef.current !== '' && !shown.active) return
-          if (draft.trim() === '' || isTriggerToken(draft)) return
+          const sources = collectComposerImages(found.card)
+          if ((draft.trim() === '' && sources.length === 0) || isTriggerToken(draft)) return
           if (dismissedRef.current !== null && dismissedRef.current.draft === draft) return
-          if (caretAtEnd(found.editor) === null) return
+          if (draft.trim() !== '' && caretAtEnd(found.editor) === null) return
           event.preventDefault()
           event.stopPropagation()
-          void request('continue', draft.slice(-MAX_DRAFT_CHARS))
+          void request('continue', draft.slice(-MAX_DRAFT_CHARS), sources)
         }
         document.addEventListener('keydown', onKeyDown, true)
         return () => document.removeEventListener('keydown', onKeyDown, true)
@@ -845,8 +977,8 @@ window.__ModuleLoader__.load({
         hasGhost &&
         box !== null &&
         (ghost.mode === 'next'
-          ? draft === '' && (hasNotice || !running)
-          : draft.trim() !== '' && (hasNotice || !isTriggerToken(draft)))
+          ? draft === '' && !hasAttachments && (hasNotice || !running)
+          : (draft.trim() !== '' || hasAttachments) && (hasNotice || !isTriggerToken(draft)))
       ghostRef.current = ghost
       visibleRef.current = visible && box !== null
 
@@ -913,11 +1045,6 @@ window.__ModuleLoader__.load({
             setBox((previous) => (previous === null ? previous : null))
             return
           }
-          const caret = caretAtEnd(found.editor)
-          if (caret === null) {
-            setBox((previous) => (previous === null ? previous : null))
-            return
-          }
           const editorRect = found.editor.getBoundingClientRect()
           if (editorRect.width <= 0 || editorRect.height <= 0) {
             setBox((previous) => (previous === null ? previous : null))
@@ -925,6 +1052,37 @@ window.__ModuleLoader__.load({
           }
           const cardRect = found.card.getBoundingClientRect()
           const computed = window.getComputedStyle(found.editor)
+          const caret = caretAtEnd(found.editor)
+          if (caret === null) {
+            if (draft.trim() !== '' || !hasAttachments) {
+              setBox((previous) => (previous === null ? previous : null))
+              return
+            }
+            // Image-only: there is no caret line to follow, so the ghost sits in the text column.
+            const lineHeight = Number.parseFloat(computed.lineHeight)
+            const paddingTop = Number.parseFloat(computed.paddingTop)
+            const paddingLeft = Number.parseFloat(computed.paddingLeft)
+            const paddingRight = Number.parseFloat(computed.paddingRight)
+            const topInset = Number.isFinite(paddingTop) ? paddingTop : EDITOR_INSET_TOP
+            const leftInset = Number.isFinite(paddingLeft) ? paddingLeft : EDITOR_INSET_LEFT
+            const rightInset = Number.isFinite(paddingRight) ? paddingRight : EDITOR_INSET_RIGHT
+            const font = typographyOf(computed)
+            const left = Math.max(0, Math.round(editorRect.left - cardRect.left + leftInset))
+            const next = {
+              font,
+              typo: JSON.stringify(font),
+              top: Math.max(0, Math.round(editorRect.top - cardRect.top + topInset)),
+              left,
+              right: Number.isFinite(editorRect.right)
+                ? Math.max(EDITOR_INSET_RIGHT, Math.round(cardRect.right - editorRect.right + rightInset))
+                : EDITOR_INSET_RIGHT + EDITOR_SCROLL_MARGIN,
+              height: Number.isFinite(lineHeight) && lineHeight > 0 ? Math.round(lineHeight) : FALLBACK_LINE_HEIGHT,
+              columnLeft: left,
+              lineBreak: false,
+            }
+            setBox((previous) => (sameBox(previous, next) ? previous : next))
+            return
+          }
           const lineHeight = Number.parseFloat(computed.lineHeight)
           // The caret rectangle is the glyph box; the draft's line box is taller by the line spacing.
           // The ghost's own first line box must land on the draft's, so half the difference moves up.
@@ -985,7 +1143,7 @@ window.__ModuleLoader__.load({
           window.removeEventListener('resize', schedule)
           observer?.disconnect()
         }
-      }, [ghost.mode, draft, sessionId, running, hasGhost, hasNotice])
+      }, [ghost.mode, draft, sessionId, running, hasGhost, hasNotice, hasAttachments])
 
       const accept = () => {
         const value = currentRef.current
@@ -1056,7 +1214,7 @@ window.__ModuleLoader__.load({
           // Tab belongs to the editor only; on composer controls it must keep
           // its normal focus-traversal behavior.
           if (!inEditor || ghost.active) return
-          if (ghost.mode === 'continue' && caretAtEnd(found.editor) === null) return
+          if (ghost.mode === 'continue' && draft.trim() !== '' && caretAtEnd(found.editor) === null) return
           event.preventDefault()
           event.stopPropagation()
           acceptRef.current?.()
@@ -1164,7 +1322,7 @@ window.__ModuleLoader__.load({
 
     return {
       inject: ['slots', 'locale'],
-      __testing: { caretAtEnd, joinContinuation, parseSseText, streamingCandidate, cleanLine, consumeStream, setPref, readPrefs, readStatus, reportStatus, describeRoute, dismissedSeqs },
+      __testing: { caretAtEnd, joinContinuation, parseSseText, streamingCandidate, cleanLine, consumeStream, setPref, readPrefs, readStatus, reportStatus, describeRoute, dismissedSeqs, collectComposerImages, encodeComposerImages, dataUrlParts },
       apply(ctx) {
         const t = ctx.locale.bind(NS)
         ctx.effect(() => ctx.locale.register(NS, DICTIONARIES))

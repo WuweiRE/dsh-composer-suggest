@@ -76,14 +76,16 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
   const fetchCalls = []
   const registered = {}
   const dictionaries = {}
-  const view = { draft: '', prefix: undefined, tail: '', caretOffset: 100, width: 600, insert: true, focusInEditor: true, scrollBottom: 100, ghostBottom: 0, hasScroll: true, caretHeight: 24, computed: { lineHeight: '24px' } }
+  const view = { draft: '', prefix: undefined, tail: '', caretOffset: 100, width: 600, insert: true, focusInEditor: true, scrollBottom: 100, ghostBottom: 0, hasScroll: true, caretHeight: 24, computed: { lineHeight: '24px' }, attachmentIds: [], images: [], imageBytes: 4 }
 
   // The Host wraps the editor in a scroll element (data-input-scroll); a margin set on it moves the toolbar.
   const scroll = { style: { marginBottom: '' }, getBoundingClientRect: () => ({ bottom: view.scrollBottom }) }
-  const editor = { closest: (selector) => (selector === '[data-input-scroll]' && view.hasScroll ? scroll : null), contains: (node) => (node === document.activeElement ? view.focusInEditor : true), getBoundingClientRect: () => ({ width: view.width, height: 100 }) }
+  const editor = { closest: (selector) => (selector === '[data-input-scroll]' && view.hasScroll ? scroll : null), contains: (node) => (node === document.activeElement ? view.focusInEditor : true), getBoundingClientRect: () => ({ left: 0, top: 0, right: view.width - 4, width: view.width, height: 100 }) }
   const card = {
     contains: () => true,
     querySelector: () => editor,
+    // The Host's attachment rail renders one <img> per pasted picture.
+    querySelectorAll: (selector) => (selector === 'img' ? view.images : []),
     getBoundingClientRect: () => ({ left: 0, top: 0, right: view.width, width: view.width, height: 100 }),
   }
   const document = {
@@ -97,6 +99,11 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
         setStart() { part = 'tail' },
         toString: () => (part === 'tail' ? view.tail : (view.prefix ?? view.draft)),
       }
+    },
+    createElement: (tag) => {
+      if (tag !== 'canvas') throw new Error(`unexpected element: ${tag}`)
+      // No 2d context: the encoder falls back to the source bytes, which is what these tests check.
+      return { width: 0, height: 0, getContext: () => null, toDataURL: () => 'data:image/jpeg;base64,AAAA' }
     },
     addEventListener: (name, fn) => {
       if (!handlers.has(name)) handlers.set(name, [])
@@ -163,10 +170,26 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
     useLayoutEffect: (fn, deps) => scheduleEffect(layouts, fn, deps),
     useSyncExternalStore: (_subscribe, read) => read(),
   }
+  const imageFetches = []
   const context = {
     window,
     document,
+    FileReader: class {
+      readAsDataURL(blob) {
+        blob.arrayBuffer().then((buffer) => {
+          this.result = `data:${blob.type || 'image/png'};base64,${Buffer.from(buffer).toString('base64')}`
+          this.onload?.()
+        })
+      }
+    },
+    createImageBitmap: async (blob) => ({ width: 40, height: 30, close() {} }),
     fetch: async (url, init) => {
+      // A composer thumbnail is fetched from its blob: URL; the prediction goes to the endpoint.
+      if (String(url).startsWith('blob:') || String(url).startsWith('data:')) {
+        imageFetches.push({ url, init })
+        if (view.imageUnreadable === true) return new Response('nope', { status: 404 })
+        return new Response(new Uint8Array(view.imageBytes).fill(7), { headers: { 'content-type': 'image/png' } })
+      }
       fetchCalls.push({ url, init })
       if (fetch === undefined) return streamResponse('')
       return fetch(url, init)
@@ -174,6 +197,7 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
     console: { warn: (...args) => warnings.push(args.join(' ')) },
     AbortController,
     TextDecoder,
+    Buffer,
     ReadableStream,
     Response,
     requestAnimationFrame: () => 1,
@@ -204,8 +228,9 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
     setDraft: () => { throw new Error('Must never replace the draft') },
   }
 
-  function render({ draft = '', ghost, box, running = false, reserve = 0 } = {}) {
+  function render({ draft = '', ghost, box, running = false, reserve = 0, attachments } = {}) {
     view.draft = draft
+    if (attachments !== undefined) view.attachmentIds = attachments
     index = 0
     refIndex = 0
     effectIndex = 0
@@ -222,7 +247,7 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
     ]
     const wrapper = registered['conversation.input.overlay'].component({
       sessionId: 's1',
-      useInput: (select) => select({ draft }),
+      useInput: (select) => select({ draft, attachmentIds: view.attachmentIds }),
       useSessionStatus: (select) => select(new Map([['s1', { running }]])),
       inputActions,
     })
@@ -230,7 +255,7 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
     return { tree, state, effects, layouts, listeners, request, timers }
   }
 
-  return { module, registered, render, view, scroll, inserted, fetchCalls, warnings, windowListeners, localStorage, dictionaries, effects, layouts, listeners, timers }
+  return { module, registered, render, view, scroll, inserted, fetchCalls, imageFetches, warnings, windowListeners, localStorage, dictionaries, effects, layouts, listeners, timers }
 }
 
 function keyEvent(key, extra = {}) {
@@ -538,6 +563,147 @@ test('Tab asks, Tab accepts, and continuations can be chained', async () => {
   assert.equal(again.prevented, true)
   assert.equal(app.fetchCalls.length, 2)
   assert.equal(JSON.parse(app.fetchCalls[1].init.body).draft, 'Can you also update the README')
+})
+
+test('Tab continues from an attached image alone, and the request carries that image', async () => {
+  const app = load({ fetch: async () => streamResponse(sse({ type: 'done', items: ['What is this error?'], seq: 4, images: 'used' })) })
+  app.view.images = [{ src: 'blob:shot', alt: 'shot.png', closest: () => null }]
+  const rendered = app.render({ draft: '', attachments: ['a1'] })
+  runEffects(rendered)
+  const tab = keyEvent('Tab')
+  rendered.listeners.get('keydown')(tab)
+  assert.equal(tab.prevented, true, 'Tab is taken for the continuation')
+  await tick()
+
+  assert.equal(app.imageFetches.length, 1, 'the thumbnail is read')
+  assert.equal(app.fetchCalls.length, 1)
+  const body = JSON.parse(app.fetchCalls[0].init.body)
+  same(body, { sessionId: 's1', mode: 'continue', draft: '', images: [{ mediaType: 'image/png', data: 'BwcHBw==', name: 'shot.png' }] })
+  // The finished suggestion is accepted by the next Tab like any other continuation.
+  const accepted = app.render({ draft: '', attachments: ['a1'], ghost: rendered.state[0] })
+  runEffects(accepted)
+  accepted.listeners.get('keydown')(keyEvent('Tab'))
+  same(app.inserted, ['What is this error?'])
+})
+
+test('text and images travel together, and text still has to end at the caret', async () => {
+  const app = load({ fetch: async () => streamResponse(sse({ type: 'done', items: [' the cause'], seq: 4 })) })
+  app.view.images = [{ src: 'blob:shot', closest: () => null }]
+  const atEnd = app.render({ draft: 'Find', attachments: ['a1'] })
+  runEffects(atEnd)
+  atEnd.listeners.get('keydown')(keyEvent('Tab'))
+  await tick()
+  const body = JSON.parse(app.fetchCalls[0].init.body)
+  assert.equal(body.draft, 'Find')
+  assert.equal(body.images.length, 1)
+
+  const midDraft = load({ fetch: async () => streamResponse(sse({ type: 'done', items: ['x'], seq: 4 })) })
+  midDraft.view.images = [{ src: 'blob:shot', closest: () => null }]
+  midDraft.view.tail = 'rest of the draft'
+  const mid = midDraft.render({ draft: 'Find the cause', attachments: ['a1'] })
+  runEffects(mid)
+  const tab = keyEvent('Tab')
+  mid.listeners.get('keydown')(tab)
+  assert.equal(tab.prevented, false, 'Tab keeps its normal job away from the end')
+  assert.equal(midDraft.fetchCalls.length, 0)
+})
+
+test('an attached picture suppresses the next-message offer, and removing it brings the offer back', () => {
+  const withImage = load()
+  const rendered = withImage.render({ draft: '', attachments: ['a1'] })
+  runEffects(rendered)
+  assert.equal(rendered.timers.length, 0, 'no next-message prediction while a picture is attached')
+  assert.equal(rendered.tree.props['data-composer-suggest-anchor'] !== undefined, true, 'only the anchor renders')
+
+  const empty = load()
+  const cleared = empty.render({ draft: '', attachments: [] })
+  runEffects(cleared)
+  same(cleared.timers.map((timer) => timer.ms), [600])
+})
+
+test('an image-only continuation is drawn in the text column, since there is no caret line to follow', () => {
+  const app = load()
+  const ghost = { mode: 'continue', items: [' 看图说一句'] }
+  const rendered = app.render({ draft: '', attachments: ['a1'], ghost })
+  for (const layout of rendered.layouts) layout()
+  const box = rendered.state[1]
+  assert.ok(box !== null, 'the ghost has a place to go')
+  assert.equal(box.left, 14, 'the editor left inset')
+  assert.equal(box.columnLeft, 14)
+  assert.equal(box.lineBreak, false)
+  const shown = app.render({ draft: '', attachments: ['a1'], ghost, box })
+  assert.equal(shown.tree.children[1].props.style.textIndent, 0)
+  assert.equal(shown.tree.children[1].props.style.left, 14)
+})
+
+test('an unreadable picture with no text says so instead of asking the model', async () => {
+  const app = load({ fetch: async () => streamResponse(sse({ type: 'done', items: ['x'], seq: 4 })) })
+  app.view.imageUnreadable = true
+  app.view.images = [{ src: 'blob:shot', closest: () => null }]
+  const rendered = app.render({ draft: '', attachments: ['a1'] })
+  runEffects(rendered)
+  rendered.listeners.get('keydown')(keyEvent('Tab'))
+  await tick()
+  assert.equal(app.fetchCalls.length, 0, 'nothing is asked')
+  assert.deepEqual({ ...app.module.__testing.readStatus() }, { state: 'note', key: 'imagesUnread' })
+})
+
+test('adding or removing a picture re-arms Tab after Escape', async () => {
+  const app = load({ fetch: async () => streamResponse(sse({ type: 'done', items: [' more'], seq: 4 })) })
+  app.view.images = [{ src: 'blob:shot', closest: () => null }]
+  const first = app.render({ draft: 'Add', attachments: ['a1'] })
+  runEffects(first)
+  first.listeners.get('keydown')(keyEvent('Tab'))
+  await tick()
+  const finished = app.render({ draft: 'Add', attachments: ['a1'], ghost: first.state[0] })
+  runEffects(finished)
+  finished.listeners.get('keydown')(keyEvent('Escape'))
+  const dismissed = app.render({ draft: 'Add', attachments: ['a1'] })
+  runEffects(dismissed)
+  const blocked = keyEvent('Tab')
+  dismissed.listeners.get('keydown')(blocked)
+  assert.equal(blocked.prevented, false, 'dismissed for this draft')
+
+  const changed = app.render({ draft: 'Add', attachments: ['a1', 'a2'] })
+  runEffects(changed)
+  const again = keyEvent('Tab')
+  changed.listeners.get('keydown')(again)
+  assert.equal(again.prevented, true, 'another picture is another draft')
+  await tick()
+  assert.equal(app.fetchCalls.length, 2)
+})
+
+test('the status line says when the model could not see the pictures', () => {
+  const app = load()
+  const { reportStatus } = app.module.__testing
+  const element = app.registered['settings.general.item'].component()
+  const row = element.type(element.props)
+  const statusElement = row.children.find((child) => child && child.type && child.type.name === 'StatusLine')
+  const text = () => statusElement.type(statusElement.props).children[0]
+
+  reportStatus({ state: 'ok', route: 'claude-suggest / claude-sonnet-5-5', ms: 900, images: 'used' })
+  assert.equal(text(), 'Last suggestion: claude-suggest / claude-sonnet-5-5 · 900 ms')
+  reportStatus({ state: 'ok', route: 'claude-suggest / claude-sonnet-5-5', ms: 900, images: 'skipped' })
+  assert.equal(text(), 'Last suggestion: claude-suggest / claude-sonnet-5-5 · 900 ms The model could not see the attached images.')
+})
+
+test('the composer thumbnails are read from the card only, never from elsewhere', () => {
+  const { collectComposerImages } = load().module.__testing
+  const make = (src, extra = {}) => ({ src, closest: () => null, ...extra })
+  const card = {
+    querySelectorAll: () => [
+      make('blob:a'),
+      make('blob:a'),
+      make('data:image/png;base64,AAAA'),
+      make('data:image/svg+xml;base64,AAAA'),
+      make('https://example.com/avatar.png'),
+      make(''),
+      make('blob:b', { closest: () => ({}) }),
+      make('blob:c', { alt: 'screen.png' }),
+    ],
+  }
+  same(collectComposerImages(card), [{ src: 'blob:a' }, { src: 'data:image/png;base64,AAAA' }, { src: 'blob:c', name: 'screen.png' }])
+  same(collectComposerImages(null), [])
 })
 
 test('Escape cancels a continuation in flight, and Tab passes through for that draft until it changes', () => {

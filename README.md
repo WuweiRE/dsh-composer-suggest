@@ -9,6 +9,12 @@ Composer suggestions for the DeepSeek Harness Web UI.
   the conversation above and your draft; press **Tab** again to accept the result, or
   **Esc** to cancel. Nothing is asked until you press Tab, and Tab keeps its usual job
   anywhere else (empty composer, caret mid-draft, a `/` command or `@` reference).
+- **Pasted images**: an image attached to the composer counts as draft content, so Tab
+  works with nothing typed and the model writes the message you are likely to send about
+  it. Up to three images ride along with a continuation, taken from the composer's own
+  thumbnails and shrunk to 1024px before they are sent. A model that cannot see images
+  continues the text instead and the status line says the images were not seen; with
+  nothing typed, the composer says so rather than guessing.
 - **Tab** accepts a suggestion as an editable draft (nothing is sent),
   **Alt+Down / Alt+Up** cycle up to three candidates, **Esc** withdraws the offer, and
   typing discards it.
@@ -42,6 +48,9 @@ dsh plugin --profile <name> add dsh-composer-suggest
 Restart the Harness afterwards, then refresh the Web page. Developed and tested against
 DeepSeek Harness 0.2.2-rc.1. It needs a Harness that provides `conversation.input.overlay`,
 `settings.general.item`, `connection.admit()`, `ctx.llm` and `session.deriveMessages()`.
+Images additionally use the `attachments` service (`saveImages`) and the composer's
+attachment thumbnails, which the Host renders as `<img>` elements with `blob:` sources
+inside the composer card. Without them a continuation still works from text alone.
 
 ## Model
 

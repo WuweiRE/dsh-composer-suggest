@@ -39,6 +39,16 @@ function makeHarness(options = {}) {
   let reply = options.reply ?? 'ok'
   let finish = options.finish ?? { kind: 'stop' }
   let failing = options.fail === true
+  const saved = []
+  const attachments = options.attachments === false
+    ? undefined
+    : {
+        async saveImages(inputs) {
+          if (options.saveFails === true) throw new Error('refused')
+          saved.push(...inputs)
+          return inputs.map((input, i) => ({ attachmentId: `att-${saved.length - inputs.length + i}`, mediaType: input.mediaType, bytes: input.data.length, width: 1, height: 1, ...(input.name === undefined ? {} : { name: input.name }) }))
+        },
+      }
   const catalog = options.catalog ?? { claude2: ['claude-opus-5-5', 'claude-sonnet-5-5'], 'deepseek-zcode': ['deepseek-flash'] }
 
   const llm = {
@@ -55,6 +65,7 @@ function makeHarness(options = {}) {
       const controls = configure === undefined ? { ...config } : configure({ ...config }, model)
       return {
         config: { ...config, ...controls },
+        ...(options.inputModalities === undefined ? {} : { inputModalities: options.inputModalities }),
         async *stream(request) {
           llmCalls.push({ config, controls, request })
           if (failing) throw new Error('model exploded')
@@ -81,7 +92,7 @@ function makeHarness(options = {}) {
     sessions: { get: (id) => sessions.get(id) },
     connection: { admit: options.admit ?? (() => ({ peer: { principal: { kind: 'owner' } } })) },
     llm,
-    get: (key) => (key === 'agentDefaultModel' ? options.fallbackModel : undefined),
+    get: (key) => (key === 'agentDefaultModel' ? options.fallbackModel : key === 'attachments' ? attachments : undefined),
   }
 
   apply(ctx, options.config)
@@ -90,6 +101,7 @@ function makeHarness(options = {}) {
     sessions,
     llmCalls,
     listCalls,
+    saved,
     dispose: () => disposers.reverse().forEach((fn) => fn()),
     setReply(value) {
       reply = value
@@ -338,6 +350,135 @@ test('naming the configured model in Settings keeps the configured provider', as
   assert.equal(harness.llmCalls[2].config.model, 'claude-opus-5-5')
 })
 
+const PIXEL = Buffer.from('not really a jpeg but valid bytes').toString('base64')
+const picture = (extra = {}) => ({ mediaType: 'image/jpeg', data: PIXEL, name: 'shot.jpg', ...extra })
+
+test('a pasted image alone is enough to continue: the model is shown it and writes the message', async () => {
+  const harness = makeHarness({ reply: 'Can you explain this error?', inputModalities: ['text', 'image'] })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const events = sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'continue', draft: '', images: [picture()] }))
+  const done = events.at(-1)
+  assert.equal(done.type, 'done')
+  assert.equal(done.images, 'used')
+  assert.deepEqual(done.items, ['Can you explain this error?'])
+
+  const content = harness.llmCalls[0].request.messages[0].content
+  assert.equal(content[0].type, 'image', 'the image comes before the text')
+  assert.equal(content[0].attachment.attachmentId, 'att-0')
+  assert.equal(content[0].attachment.name, 'shot.jpg')
+  assert.equal(content.at(-1).type, 'text')
+  assert.match(content.at(-1).text, /attached 1 image/)
+  assert.match(content.at(-1).text, /The draft is empty/)
+  assert.match(content.at(-1).text, /most likely to send with these images/)
+  assert.equal(harness.saved.length, 1)
+  assert.equal(harness.saved[0].mediaType, 'image/jpeg')
+  assert.deepEqual([...harness.saved[0].data], [...Buffer.from(PIXEL, 'base64')], 'the stored bytes are the pasted bytes')
+})
+
+test('typed text and an image go together, and the draft is still the text before the caret', async () => {
+  const harness = makeHarness({ reply: ' this stack trace', inputModalities: ['text', 'image'] })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const done = sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'continue', draft: 'Why does', images: [picture(), picture({ name: 'b.jpg' })] })).at(-1)
+  assert.equal(done.images, 'used')
+  assert.deepEqual(done.items, [' this stack trace'])
+  const content = harness.llmCalls[0].request.messages[0].content
+  assert.deepEqual(content.map((block) => block.type), ['image', 'image', 'text'])
+  assert.match(content.at(-1).text, /Draft text ending at the caret:\s+"Why does"/)
+  assert.match(content.at(-1).text, /attached 2 images/)
+})
+
+test('with neither text nor an image there is still nothing to continue', async () => {
+  const harness = makeHarness({ inputModalities: ['text', 'image'] })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  assert.equal(jsonBody(await callRoute(harness, { sessionId: 's1', mode: 'continue', draft: '  ', images: [] })).reason, 'no-draft')
+  assert.equal(harness.llmCalls.length, 0)
+})
+
+test('a model that cannot see images continues the text and says the images were not seen', async () => {
+  const harness = makeHarness({ reply: ' the cause', inputModalities: ['text'] })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const done = sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'continue', draft: 'Find', images: [picture()] })).at(-1)
+  assert.equal(done.type, 'done')
+  assert.equal(done.images, 'skipped')
+  assert.deepEqual(done.items, [' the cause'])
+  const content = harness.llmCalls[0].request.messages[0].content
+  assert.deepEqual(content.map((block) => block.type), ['text'], 'no image reaches a text-only model')
+  assert.match(content[0].text, /cannot see/)
+  assert.equal(harness.saved.length, 0, 'nothing is stored for a model that will not use it')
+})
+
+test('an image with no text for a model that cannot see it is reported, not guessed at', async () => {
+  const harness = makeHarness({ reply: 'unused', inputModalities: ['text'] })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const last = sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'continue', draft: '', images: [picture()] })).at(-1)
+  assert.equal(last.type, 'error')
+  assert.equal(last.reason, 'images-unseen')
+  assert.equal(harness.llmCalls.length, 0)
+})
+
+test('when the images cannot be stored the text still continues, or the empty draft says why', async () => {
+  const refused = makeHarness({ reply: ' more', inputModalities: ['text', 'image'], saveFails: true })
+  refused.sessions.set('s1', makeSession(CONVERSATION))
+  const withText = sseEvents(await callRoute(refused, { sessionId: 's1', mode: 'continue', draft: 'Add', images: [picture()] })).at(-1)
+  assert.equal(withText.images, 'refused')
+  assert.deepEqual(withText.items, [' more'])
+  const alone = sseEvents(await callRoute(refused, { sessionId: 's1', mode: 'continue', draft: '', images: [picture()] })).at(-1)
+  assert.equal(alone.reason, 'images-unavailable')
+
+  const noStore = makeHarness({ reply: ' more', inputModalities: ['text', 'image'], attachments: false })
+  noStore.sessions.set('s1', makeSession(CONVERSATION))
+  const missing = sseEvents(await callRoute(noStore, { sessionId: 's1', mode: 'continue', draft: 'Add', images: [picture()] })).at(-1)
+  assert.equal(missing.images, 'unavailable')
+  assert.deepEqual(missing.items, [' more'])
+})
+
+test('an unknown model capability is tried, since the provider will refuse if it must', async () => {
+  const harness = makeHarness({ reply: ' now' })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const done = sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'continue', draft: 'Look', images: [picture()] })).at(-1)
+  assert.equal(done.images, 'used')
+})
+
+test('images are validated before any storage or model call', async () => {
+  const harness = makeHarness({ inputModalities: ['text', 'image'] })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const bad = [
+    'not an array',
+    [picture(), picture(), picture(), picture()],
+    [{ mediaType: 'image/svg+xml', data: PIXEL }],
+    [{ mediaType: 'image/jpeg', data: 'not base64 !!' }],
+    [{ mediaType: 'image/jpeg', data: '' }],
+    [{ mediaType: 'image/jpeg', data: Buffer.alloc(800_001).toString('base64') }],
+    [null],
+  ]
+  for (const images of bad) {
+    const response = await callRoute(harness, { sessionId: 's1', mode: 'continue', draft: 'Look', images })
+    assert.equal(response.status, 400, JSON.stringify(images).slice(0, 60))
+    assert.equal(jsonBody(response).reason, 'invalid-images')
+  }
+  assert.equal(harness.llmCalls.length, 0)
+  assert.equal(harness.saved.length, 0)
+  // A next-message request never carries images, whatever the body says.
+  const next = sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'next', images: [picture()] })).at(-1)
+  assert.equal(next.type, 'done')
+  assert.deepEqual(harness.llmCalls[0].request.messages[0].content.map((block) => block.type), ['text'])
+})
+
+test('the result cache tells different pictures apart and reuses the same ones', async () => {
+  const harness = makeHarness({ reply: 'ok then', inputModalities: ['text', 'image'] })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const ask = (images) => callRoute(harness, { sessionId: 's1', mode: 'continue', draft: 'Look', images })
+  await ask([picture()])
+  await ask([picture()])
+  assert.equal(harness.llmCalls.length, 1, 'the same picture is served from the cache')
+  const other = Buffer.from('a different picture entirely').toString('base64')
+  await ask([picture({ data: other })])
+  assert.equal(harness.llmCalls.length, 2, 'another picture is another request')
+  const cached = sseEvents(await ask([picture()])).at(-1)
+  assert.equal(cached.cached, true)
+  assert.equal(cached.images, 'used', 'a cached answer still says what the model saw')
+})
+
 test('the result cache keeps models apart', async () => {
   const harness = makeHarness({ reply: 'go' })
   harness.sessions.set('s1', makeSession(CONVERSATION))
@@ -519,7 +660,7 @@ test('requests are validated before any model call', async () => {
   const wrongMethod = await callRoute(harness, undefined, makeRequest(undefined, { method: 'GET' }))
   assert.equal(wrongMethod.status, 405)
 
-  const huge = await callRoute(harness, undefined, makeRequest({ sessionId: 's1', mode: 'continue', draft: 'x'.repeat(100_000) }))
+  const huge = await callRoute(harness, undefined, makeRequest({ sessionId: 's1', mode: 'continue', draft: 'x'.repeat(5 * 1024 * 1024) }))
   assert.equal(huge.status, 400)
 
   assert.equal(harness.llmCalls.length, 0)

@@ -16,6 +16,8 @@
  * dsh-composer-prediction (Amir Bazylkhanov); see THIRD_PARTY_NOTICES.md.
  */
 
+import { createHash } from 'node:crypto'
+
 export const name = 'composer-suggest'
 
 export const inject = ['connection', 'llm', 'sessions', 'webServer']
@@ -23,11 +25,16 @@ export const inject = ['connection', 'llm', 'sessions', 'webServer']
 /** Same-origin streaming endpoint the Client half posts to (SSE: meta, delta, done, error). */
 const ENDPOINT = '/composer-suggest/stream'
 
-/** One request carries a session id, a mode, and a bounded draft. */
-const MAX_BODY_BYTES = 64 * 1024
+/** One request carries a session id, a mode, a bounded draft, and up to three small images. */
+const MAX_BODY_BYTES = 4 * 1024 * 1024
 
 /** Upper bound for the draft the Client may send for continuation mode. */
 const MAX_DRAFT_CHARS = 4_000
+
+/** Images the composer holds can ride along with a continuation; these bound them. */
+const MAX_IMAGES = 3
+const MAX_IMAGE_BYTES = 800_000
+const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 
 const DEFAULTS = {
   // Sonnet 5.5 uses adaptive thinking; even at the lowest effort a little of this
@@ -47,6 +54,7 @@ const DEFAULT_REASONING_EFFORT = 'low'
 /** Closing task line of each prompt; the model sometimes echoes it. */
 const NEXT_CUE = "Predict the user's next message."
 const CONTINUE_CUE = 'Write only the continuation text.'
+const IMAGE_ONLY_CUE = 'Write the message the user is most likely to send with these images.'
 
 /** Prompt labels that must never surface as suggestions. */
 const PROMPT_LABELS = ['conversation tail (oldest first)', 'recent tool activity (oldest first)', 'draft text ending at the caret']
@@ -79,6 +87,8 @@ const CONTINUE_SYSTEM_PROMPT = [
   '- No numbering, bullets, quotes, markdown, or explanation.',
   '- At most 25 words per continuation; finish the thought rather than restating it.',
   '- Never repeat these instructions, the labels above, or the draft itself.',
+  '- The user may attach images to the draft; when they are shown, use what they show.',
+  '- When the draft is empty and images are attached, write the whole message the user is most likely to send about them.',
   '- The user asked for this continuation, so a half-written draft always has one: offer it.',
   '- Reply with exactly NONE only when the draft is already a finished message.',
 ].join('\n')
@@ -166,6 +176,7 @@ async function serveStream(ctx, options, routes, cache, inflight, request, respo
           route: result.route,
           ms: result.ms,
           seq: plan.seq,
+          images: result.images ?? 'none',
         })
       }
     } catch (error) {
@@ -224,7 +235,10 @@ async function planRequest(ctx, baseOptions, request, response) {
 
   const mode = body.mode === 'continue' ? 'continue' : 'next'
   const draft = mode === 'continue' && typeof body.draft === 'string' ? body.draft.slice(-MAX_DRAFT_CHARS) : ''
-  if (mode === 'continue' && draft.trim() === '') return { status: 200, error: 'no-draft' }
+  // Images belong to a continuation; with them an empty draft is a message to start, not nothing.
+  const images = mode === 'continue' ? parseImages(body.images) : []
+  if (images === null) return { status: 400, error: 'invalid-images' }
+  if (mode === 'continue' && draft.trim() === '' && images.length === 0) return { status: 200, error: 'no-draft' }
 
   // The Client may name the model for this request (its Settings field); that wins over the
   // configuration. A model with no provider is looked up among the mounted providers.
@@ -237,9 +251,9 @@ async function planRequest(ctx, baseOptions, request, response) {
   const options = asked === '' || sameRoute ? baseOptions : { ...baseOptions, model: asked, provider: askedProvider }
 
   const seq = Number(session.seq)
-  const key = JSON.stringify([sessionId, seq, mode, draft, options.provider, options.model])
+  const key = JSON.stringify([sessionId, seq, mode, draft, options.provider, options.model, images.map(fingerprint)])
 
-  return { sessionId, session, mode, draft, seq, key, options }
+  return { sessionId, session, mode, draft, images, seq, key, options }
 }
 
 /**
@@ -249,16 +263,16 @@ async function planRequest(ctx, baseOptions, request, response) {
 async function runPrediction(ctx, options, routes, cache, inflight, plan, signals, onDelta) {
   const remembered = cache.get(plan.key)
   if (remembered !== undefined) {
-    return { items: remembered.items, reason: undefined, cached: true, route: remembered.route, ms: 0 }
+    return { items: remembered.items, reason: undefined, cached: true, route: remembered.route, ms: 0, images: remembered.images }
   }
 
   // Each view owns its cancellation; an identical request must not cancel it.
   const controller = new AbortController()
   inflight.add(controller)
   try {
-    const result = await predict(ctx, options, routes, plan.session, plan.mode, plan.draft, joinSignals([controller.signal, ...signals]), onDelta)
+    const result = await predict(ctx, options, routes, plan.session, plan.mode, plan.draft, plan.images, joinSignals([controller.signal, ...signals]), onDelta)
     if (result.items.length > 0 && !controller.signal.aborted && !signals.some(signal => signal.aborted)) {
-      remember(cache, plan.key, { items: result.items, route: result.route })
+      remember(cache, plan.key, { items: result.items, route: result.route, images: result.images })
     }
     return result
   } finally {
@@ -270,9 +284,10 @@ async function runPrediction(ctx, options, routes, cache, inflight, plan, signal
  * Run one auxiliary model call over the transcript tail and tool activity.
  * @returns `{ items, route, ms }` on success or `{ items: [], reason }` when none is usable.
  */
-async function predict(ctx, options, routes, session, mode, draft, signal, onDelta) {
-  const prompt = buildPrompt(session, options, mode, draft)
+async function predict(ctx, options, routes, session, mode, draft, images, signal, onDelta) {
+  let prompt = buildPrompt(session, options, mode, draft, { count: images.length, visible: true })
   if (prompt === null) return { items: [], reason: 'no-conversation' }
+  const imageOnly = mode === 'continue' && draft.trim() === '' && images.length > 0
 
   const route = await resolveRoute(ctx, routes, session, options, signal)
   if (route === undefined) return { items: [], reason: options.model !== '' ? 'model-unavailable' : 'no-route' }
@@ -286,6 +301,8 @@ async function predict(ctx, options, routes, session, mode, draft, signal, onDel
   const started = Date.now()
   let text = ''
   let finish
+  // none: no images asked; used: the model was shown them; skipped / unavailable / refused: it was not.
+  let imagesUsed = images.length === 0 ? 'none' : 'skipped'
   try {
     deadline.signal.throwIfAborted()
     const call = await ctx.llm.prepareCall(
@@ -296,7 +313,23 @@ async function predict(ctx, options, routes, session, mode, draft, signal, onDel
         return effort === undefined ? controls : { ...controls, reasoningEffort: effort }
       },
     )
-    const messages = [{ role: 'user', content: [{ type: 'text', text: prompt }] }]
+    let content = [{ type: 'text', text: prompt }]
+    if (images.length > 0) {
+      const sees = modelSeesImages(call)
+      const admitted = sees ? await admitImages(ctx, images) : { skipped: 'skipped' }
+      if (admitted.refs !== undefined) {
+        content = buildUserContent(prompt, admitted.refs)
+        imagesUsed = 'used'
+      } else {
+        imagesUsed = admitted.skipped
+        // With nothing typed, the images were the whole request: there is nothing honest to offer.
+        if (imageOnly) return { items: [], reason: sees ? 'images-unavailable' : 'images-unseen', route: label, images: imagesUsed }
+        // A draft can still be continued from its text; the prompt says the images were not seen.
+        prompt = buildPrompt(session, options, mode, draft, { count: images.length, visible: false })
+        content = [{ type: 'text', text: prompt }]
+      }
+    }
+    const messages = [{ role: 'user', content }]
     for await (const chunk of call.stream({ ...call.config, messages, system, signal: deadline.signal })) {
       deadline.signal.throwIfAborted()
       if (chunk.type === 'text-delta') {
@@ -321,10 +354,12 @@ async function predict(ctx, options, routes, session, mode, draft, signal, onDel
   if (failure !== undefined) return { items: [], reason: failure, route: label }
   if (finish.kind === 'max-tokens') text = text.slice(0, text.lastIndexOf('\n') + 1)
 
-  const cue = mode === 'continue' ? CONTINUE_CUE : NEXT_CUE
+  const cue = mode === 'continue' ? (imageOnly ? IMAGE_ONLY_CUE : CONTINUE_CUE) : NEXT_CUE
   const items = normalizeCandidates(text, options.maxSuggestions, mode === 'continue' ? draft : '', cue)
   const ms = Date.now() - started
-  return items.length === 0 ? { items: [], reason: 'empty', route: label, ms } : { items, route: label, ms }
+  return items.length === 0
+    ? { items: [], reason: 'empty', route: label, ms, images: imagesUsed }
+    : { items, route: label, ms, images: imagesUsed }
 }
 
 /**
@@ -426,7 +461,7 @@ function sessionRoute(ctx, session) {
  * mode) the draft as one bounded prompt.
  * @returns `null` when `next` mode has no completed assistant reply to follow.
  */
-function buildPrompt(session, options, mode, draft) {
+function buildPrompt(session, options, mode, draft, images = { count: 0, visible: true }) {
   const limits = { messages: options.maxMessages, chars: options.maxChars, notes: options.maxToolNotes }
   const picked = []
   const notes = []
@@ -500,11 +535,79 @@ function buildPrompt(session, options, mode, draft) {
   }
 
   if (mode === 'continue') {
-    lines.push('', 'Draft text ending at the caret:', JSON.stringify(draft), '', CONTINUE_CUE)
+    if (images.count > 0) {
+      const noun = images.count === 1 ? 'image' : 'images'
+      lines.push('', images.visible
+        ? `The user attached ${images.count} ${noun} to this message; they are shown above.`
+        : `The user attached ${images.count} ${noun} that you cannot see; rely on the text alone.`)
+    }
+    if (draft.trim() === '' && images.count > 0) lines.push('', 'The draft is empty.', '', IMAGE_ONLY_CUE)
+    else lines.push('', 'Draft text ending at the caret:', JSON.stringify(draft), '', CONTINUE_CUE)
   } else {
     lines.push('', NEXT_CUE)
   }
   return lines.join('\n')
+}
+
+/**
+ * Read the images a continuation may carry: base64 of at most three small images of an
+ * accepted type. Anything malformed refuses the whole request instead of dropping parts.
+ * @returns the images, or `null` when the field is not acceptable.
+ */
+function parseImages(value) {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value) || value.length > MAX_IMAGES) return null
+  const images = []
+  for (const entry of value) {
+    if (entry === null || typeof entry !== 'object') return null
+    const mediaType = typeof entry.mediaType === 'string' ? entry.mediaType : ''
+    const data = typeof entry.data === 'string' ? entry.data.replace(/\s+/gu, '') : ''
+    if (!IMAGE_TYPES.has(mediaType) || !/^[A-Za-z0-9+/]+={0,2}$/u.test(data)) return null
+    const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0
+    const bytes = Math.floor((data.length * 3) / 4) - padding
+    if (bytes < 1 || bytes > MAX_IMAGE_BYTES) return null
+    const name = typeof entry.name === 'string' ? entry.name.slice(0, 80) : ''
+    images.push(name === '' ? { data, mediaType } : { data, mediaType, name })
+  }
+  return images
+}
+
+/** A short digest of one image, so the result cache tells one set of pictures from another. */
+function fingerprint(image) {
+  return createHash('sha256').update(image.mediaType).update(':').update(image.data).digest('hex').slice(0, 16)
+}
+
+/** Whether the model behind this prepared call takes images; an unknown capability is tried. */
+function modelSeesImages(call) {
+  const modalities = call.inputModalities
+  return !Array.isArray(modalities) || modalities.includes('image')
+}
+
+/**
+ * Store the images as attachments, which is the form a model request cites. Storage is
+ * content-addressed and independent of any Session, and nothing is appended to the log.
+ * @returns `{ refs }`, or `{ skipped }` naming why the model cannot be shown them.
+ */
+async function admitImages(ctx, images) {
+  const store = ctx.get?.('attachments')
+  if (store === undefined || store === null || typeof store.saveImages !== 'function') return { skipped: 'unavailable' }
+  try {
+    const refs = await store.saveImages(
+      images.map((image) => ({
+        data: Buffer.from(image.data, 'base64'),
+        mediaType: image.mediaType,
+        ...(image.name === undefined ? {} : { name: image.name }),
+      })),
+    )
+    return Array.isArray(refs) && refs.length === images.length ? { refs } : { skipped: 'unavailable' }
+  } catch {
+    return { skipped: 'refused' }
+  }
+}
+
+/** One user message: the images first, then the prompt text. */
+function buildUserContent(prompt, refs) {
+  return [...refs.map((attachment) => ({ type: 'image', attachment })), { type: 'text', text: prompt }]
 }
 
 function plainText(blocks) {
@@ -701,4 +804,4 @@ function timedSignal(signal, timeoutMs) {
 }
 
 /** Pure helpers exposed for the unit tests only. */
-export const __testing = { ENDPOINT, resolveOptions, resolveRoute, finishFailure, selectEffort, buildPrompt, normalizeCandidates }
+export const __testing = { ENDPOINT, resolveOptions, resolveRoute, finishFailure, selectEffort, buildPrompt, normalizeCandidates, parseImages }
