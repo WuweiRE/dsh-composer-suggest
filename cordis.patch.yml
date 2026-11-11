@@ -11,13 +11,18 @@
         # Session's provider first); with both set the route is used exactly as given.
         model: ''
         # provider: claude2
-        # Lowest effort keeps latency and cost down; falls back to the model's first
-        # advertised effort when "low" is not offered. Sonnet takes no temperature.
+        # A little thinking is worth its second or so: with thinking off, deepseek-flash
+        # gave fewer distinct continuations. Falls back to the model's first advertised
+        # effort when "low" is not offered. No temperature is sent.
         reasoningEffort: low
-        maxOutputTokens: 1024
+        # Thinking counts toward this cap; three candidates alone need under 100 tokens.
+        maxOutputTokens: 2048
         timeoutMs: 30000
         maxSuggestions: 3
-        # Prompt for both modes: transcript tail and recent tool calls.
+        # Prompt for both modes. A turn (what you typed plus the agent's final reply) counts
+        # as two messages, so 10 shows the last five turns; the latest reply gets up to
+        # 3200 of the characters, the older turns share the rest.
         maxMessages: 10
         maxChars: 8000
+        # Tool calls of the latest turn that are listed after the conversation.
         maxToolNotes: 6

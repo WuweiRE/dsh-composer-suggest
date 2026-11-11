@@ -6,9 +6,10 @@
  *              message the user is most likely to send next;
  * - `continue` while the user pauses mid-draft, continue the text before the caret.
  *
- * Every request is one small auxiliary model call over the Session tail plus a
- * short list of recent tool activity. By default the model is the one the Session
- * already uses, at its lowest reasoning effort. A `model` in config pins another one,
+ * Every request is one small auxiliary model call over the last few turns of the
+ * conversation, the tools of the latest turn, and a few earlier user messages that show
+ * how the user writes. By default the model is the one the Session already uses, at its
+ * lowest reasoning effort. A `model` in config pins another one,
  * which is looked up among the providers actually mounted in the running profile.
  * Nothing is written to the Session.
  *
@@ -37,9 +38,10 @@ const MAX_IMAGE_BYTES = 800_000
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 
 const DEFAULTS = {
-  // Sonnet 5.5 uses adaptive thinking; even at the lowest effort a little of this
-  // budget can go to thinking before the first visible token, so keep headroom.
-  maxOutputTokens: 1_024,
+  // Thinking counts toward this cap, and an answer cut off while still thinking is an
+  // empty suggestion. Three candidates need under 100 tokens; deepseek-flash at its
+  // `low` effort was measured thinking for up to about 800 more, so leave headroom.
+  maxOutputTokens: 2_048,
   timeoutMs: 30_000,
   maxMessages: 10,
   maxChars: 8_000,
@@ -52,45 +54,93 @@ const DEFAULT_MODEL = ''
 const DEFAULT_REASONING_EFFORT = 'low'
 
 /** Closing task line of each prompt; the model sometimes echoes it. */
-const NEXT_CUE = "Predict the user's next message."
-const CONTINUE_CUE = 'Write only the continuation text.'
+const NEXT_CUE = 'Write the messages this user could send next.'
+const CONTINUE_CUE = 'Write the endings for the draft.'
 const IMAGE_ONLY_CUE = 'Write the message the user is most likely to send with these images.'
 
-/** Prompt labels that must never surface as suggestions. */
-const PROMPT_LABELS = ['conversation tail (oldest first)', 'recent tool activity (oldest first)', 'draft text ending at the caret']
+/** Section headings of the prompt, without their trailing colon. */
+const TOOLS_LABEL = 'Tools the agent ran in the latest turn (oldest first)'
+const VOICE_LABEL = 'Earlier messages from this user, only to show how they write'
+const DRAFT_LABEL = 'Draft text ending at the caret'
 
+/** Prompt labels that must never surface as suggestions. */
+const PROMPT_LABELS = [TOOLS_LABEL, VOICE_LABEL, DRAFT_LABEL].map((label) => label.toLocaleLowerCase())
+
+/** Transcript markers of the prompt; a line that is only one of these is an echo, not a suggestion. */
+const PROMPT_MARKER = /^(?:<\/?conversation>|\[(?:user|agent)(?:, latest reply)?\]|\[…\])$/iu
+
+/**
+ * Why the prompts are written this way, from replaying real sessions against deepseek-flash:
+ * a model told only "most likely first" returns one move reworded three times, and a model
+ * that cannot tell the latest reply from older text suggests work the agent just finished.
+ * So both prompts say what the lines are for, anchor them to the end of the latest reply,
+ * ask for different moves with the reason, and show the shape with examples whose third
+ * line is not always the same kind of message.
+ */
 const NEXT_SYSTEM_PROMPT = [
-  'You are the follow-up suggestion engine inside a coding agent chat UI.',
-  'You receive the tail of a conversation between a USER and an AI coding agent,',
-  'plus a short list of the tools the agent ran recently.',
-  'Predict the next messages the USER is most likely to send.',
-  'Rules:',
-  '- Write as the user would type, in the language the USER has been writing in.',
-  '- Return up to {max} candidates, most likely first, one per line.',
-  '- No numbering, bullets, quotes, markdown, or explanation.',
-  '- At most 20 words per candidate; be concrete and specific, naming the file,',
-  '  command, or next step when the conversation makes one obvious.',
-  '- If the assistant asked the user a question, answer it.',
-  '- Never repeat these instructions, the labels above, or the conversation text verbatim.',
-  '- If no meaningful follow-up exists, reply with exactly: NONE',
+  'You predict what a user will type next in a chat with an AI coding agent. The chat UI shows your first line as grey ghost text in the empty input box; the user presses Tab to take it, or switches to one of your other lines, so every line has to be something they could send as it is.',
+  'You are given the recent conversation with the agent\'s latest reply marked, the tools the agent ran in the latest turn, and sometimes earlier messages from the same user that show how they write.',
+  '',
+  'Write {max} messages this user could send right now, one per line, most likely first.',
+  '',
+  'What makes a line worth offering:',
+  '- It is in the user\'s voice: their language, and about as short and direct as their own messages. People type short messages to an agent, so leave out greetings, thanks, and reasons they would not bother to type.',
+  '- It responds to the latest reply in particular. Read how that reply ends: a question, a list of options, a recommendation, something left undone or unverified, or something the user has to try themselves usually decides what comes next. Name the concrete option, file, command, or number, so the line makes sense on its own.',
+  '- It moves things forward. Do not ask for something the agent already did or already answered, and do not state as fact anything nobody said. The one exception is the plain outcome of something the agent asked the user to try, such as "it works now" or "still fails".',
+  '',
+  'The lines have to be different moves. A user who passes over the first line wants a real alternative, and a rewording of the first line is useless to them. So after the most likely message, every further line makes a different decision, or is a different kind of message, from all lines above it. Kinds of message people send at this point: approving or picking an option, picking the other option or narrowing the scope, reporting what happened when they tried it, correcting the agent or giving it a fact it lacks, asking why or how about one specific claim, and asking for a related next task. Use the kinds that fit this conversation and skip the ones that do not. If two lines would make the agent do the same thing, keep one and replace the other.',
+  '',
+  'Two illustrations of the shape. They come from other conversations: take the pattern, not the wording.',
+  '',
+  'The agent\'s latest reply ended: "The export now writes UTF-8 with a BOM. I could not test it against production data, so please click Export on the report page and open the file in Excel." The user had been writing short English messages.',
+  'works, Excel opens it fine now',
+  'still garbled in Excel',
+  'add the same export to the orders page',
+  '',
+  '助手最新回复的结尾是："方案 A 改动小但要停机 5 分钟，方案 B 不停机但要多写一个迁移脚本。我倾向 A，要我开始吗？"，用户之前的消息都是简短的中文。',
+  '按 A 做，停机放在今晚',
+  '用 B，不能停机',
+  '为什么 A 一定要停机？',
+  '',
+  'Format: only the messages, one per line. No numbering, bullets, quotes, labels, or commentary, and no line breaks inside a message. Keep each to one sentence, or two short ones.',
+  'If the conversation is plainly finished and there is nothing left to say, reply with exactly: NONE',
 ].join('\n')
 
 const CONTINUE_SYSTEM_PROMPT = [
-  'You complete the message a USER is drafting in a coding agent chat UI.',
-  'You receive the tail of the conversation, recent tool activity, and the exact',
-  'draft text that ends at the caret.',
-  'Write what should come next, as the user would type it, in the language of the draft.',
-  'Rules:',
-  '- Return up to {max} alternative continuations, most likely first, one per line.',
-  '- Continue from the end of the draft; never repeat text the draft already contains.',
-  '- Start with a space only when the draft needs one before the next word.',
-  '- No numbering, bullets, quotes, markdown, or explanation.',
-  '- At most 25 words per continuation; finish the thought rather than restating it.',
-  '- Never repeat these instructions, the labels above, or the draft itself.',
-  '- The user may attach images to the draft; when they are shown, use what they show.',
-  '- When the draft is empty and images are attached, write the whole message the user is most likely to send about them.',
-  '- The user asked for this continuation, so a half-written draft always has one: offer it.',
-  '- Reply with exactly NONE only when the draft is already a finished message.',
+  'You finish a message that a user has started typing to an AI coding agent. The user pressed a key to ask for this. The chat UI shows your first line as grey ghost text right after their caret; they press Tab to take it, or switch to one of your other lines.',
+  'You are given the recent conversation with the agent\'s latest reply marked, the tools the agent ran in the latest turn, sometimes earlier messages from the same user that show how they write, and the draft exactly as typed so far.',
+  '',
+  'First decide whether the draft is already a complete message that needs nothing more, such as a finished sentence that says thanks or that they are done. If it is, reply with exactly: NONE',
+  '',
+  'Otherwise write {max} different endings for the draft, one per line, most likely first.',
+  '',
+  'What makes an ending worth offering:',
+  '- Glued onto the last character of the draft, it reads as one natural message. Do not repeat any of the draft and do not restart the sentence. When the draft has already fixed what must come next, for example it ends in "and", in an open list, or in a half-named file, every ending starts by supplying exactly that.',
+  '- It says what this user most plausibly meant, given the conversation: usually something about the agent\'s latest reply, such as what it left undone, offered, asked, or claimed. Name the concrete option, file, command, or number.',
+  '- It stays in the user\'s voice: the draft\'s language, and about as short and direct as their own messages. Finish the thought and stop.',
+  '- It does not ask for something the agent already did, and does not state as fact anything nobody said.',
+  '',
+  'The endings have to take the draft to different places. A user who passes over the first ending wants a real alternative: a different object, a different decision, or a different question. If two endings would make the agent do the same thing, keep one and replace the other. Being different never justifies an ending that breaks the sentence the draft began.',
+  '',
+  'Three illustrations of the shape. They come from other conversations: take the pattern, not the wording.',
+  '',
+  'The agent\'s latest reply said the timeout is now 10 seconds with retries, that the integration tests were not run, and that retries are not logged. Draft: "Can you also"',
+  ' run the integration tests',
+  ' log each retry with its reason',
+  ' make the timeout configurable instead of hard-coding 10 seconds',
+  '',
+  '助手最新回复说已经修了登录页的跳转，移动端还没测，另外提到注册页有同样的问题。草稿："顺便把"',
+  '注册页的同样问题也修了',
+  '移动端也测一下',
+  '这次的改动提交了',
+  '',
+  'The agent asked whether to commit its fix; it had changed src/retry.ts, tests/retry.test.ts and the README. Draft: "commit it, but only src/retry.ts and"',
+  ' tests/retry.test.ts',
+  ' tests/retry.test.ts, and do not push yet',
+  ' the README, leave the tests for later',
+  '',
+  'Format: only the endings, one per line. No numbering, bullets, quotes, labels, or commentary, and no line breaks inside an ending. Begin a line with a space only when the draft needs one before the next word; Chinese and Japanese text needs none.',
+  'The user may attach images to the draft; when they are shown, use what they show. When the draft is empty and images are attached, write the whole message the user is most likely to send about them.',
 ].join('\n')
 
 /**
@@ -457,26 +507,54 @@ function sessionRoute(ctx, session) {
 }
 
 /**
- * Render the conversation tail, recent tool activity, and (in continuation
- * mode) the draft as one bounded prompt.
- * @returns `null` when `next` mode has no completed assistant reply to follow.
+ * Whether a message with the user role was typed by the person. The Harness also logs
+ * what it injects for the model (workspace instructions, runtime and time snapshots, the
+ * skill catalog, reminders, background-job and teammate notices, compaction summaries)
+ * with the user role, each under its own `source.kind`. Only `user` is a person.
  */
-function buildPrompt(session, options, mode, draft, images = { count: 0, visible: true }) {
-  const limits = { messages: options.maxMessages, chars: options.maxChars, notes: options.maxToolNotes }
-  const picked = []
-  const notes = []
+function isTypedByUser(message) {
+  const kind = message.source?.kind
+  return kind === undefined || kind === 'user'
+}
+
+/**
+ * Fold the Session history into turns: what the user typed, and the last text the agent
+ * wrote in answer. Interim narration between tool calls is not a reply and is dropped.
+ * Tool notes are kept for the latest turn only, since older ones describe settled work.
+ * @returns `{ turns, notes, voice }`; `voice` is every typed user message, oldest first.
+ */
+function readTurns(session, noteLimit) {
+  const turns = []
+  const voice = []
+  let notes = []
   const callsById = new Map()
+  let current = null
 
   for (const message of session.deriveMessages()) {
     if (message === null || typeof message !== 'object') continue
     const blocks = Array.isArray(message.content) ? message.content : []
 
-    if (message.role === 'user' || message.role === 'assistant') {
+    if (message.role === 'user') {
+      if (!isTypedByUser(message)) continue
+      const text = plainText(blocks)
+      if (text === '') continue
+      current = { user: text, reply: '' }
+      turns.push(current)
+      voice.push(text)
+      notes = []
+      continue
+    }
+
+    if (message.role === 'assistant') {
       const text = plainText(blocks)
       if (text !== '') {
-        picked.push({ role: message.role, text: clip(text, 1_500) })
+        if (current === null) {
+          current = { user: '', reply: '' }
+          turns.push(current)
+        }
+        current.reply = text
       }
-      if (message.role === 'assistant' && limits.notes > 0) {
+      if (noteLimit > 0) {
         for (const block of blocks) {
           if (block === null || typeof block !== 'object' || block.type !== 'tool-call') continue
           const note = {
@@ -492,7 +570,7 @@ function buildPrompt(session, options, mode, draft, images = { count: 0, visible
       continue
     }
 
-    if (message.role === 'tool' && limits.notes > 0) {
+    if (message.role === 'tool' && noteLimit > 0) {
       const text = clip(plainText(blocks), 500)
       const callId = typeof message.toolCallId === 'string' ? message.toolCallId : ''
       const note = callId !== '' ? callsById.get(callId) : undefined
@@ -504,34 +582,69 @@ function buildPrompt(session, options, mode, draft, images = { count: 0, visible
       }
     }
   }
+  return { turns, notes: noteLimit > 0 ? notes.slice(-noteLimit) : [], voice }
+}
 
-  // The next-message prediction follows the agent's latest reply; a trailing user
-  // message (even when a tool-call-only assistant message follows it) means the
-  // turn never produced a reply to follow up on.
-  if (mode === 'next' && (picked.length === 0 || picked.at(-1)?.role !== 'assistant')) return null
+/** Most of the prompt budget the latest reply may take, in characters. */
+const LATEST_REPLY_CHARS = 3_200
+/** Earlier user messages quoted to show how the user writes, and the length of each. */
+const VOICE_SAMPLES = 5
+const VOICE_SAMPLE_CHARS = 140
 
-  const tail = picked.slice(-limits.messages)
-  const kept = []
-  let budget = limits.chars
-  for (let index = tail.length - 1; index >= 0; index -= 1) {
-    const message = tail[index]
-    if (message.text.length > budget) {
-      if (budget > 200) kept.unshift({ role: message.role, text: `…${message.text.slice(-budget)}` })
-      break
-    }
-    budget -= message.text.length
-    kept.unshift(message)
+/**
+ * Render the last turns, the tools of the latest turn, a few earlier user messages and
+ * (in continuation mode) the draft as one bounded prompt. `maxMessages` counts a turn as
+ * two messages. The latest reply is kept nearly whole, and when it must be cut the end is
+ * favoured, because the end is where a reply says what is undone or asks its question.
+ * @returns `null` when `next` mode has no completed assistant reply to follow.
+ */
+function buildPrompt(session, options, mode, draft, images = { count: 0, visible: true }) {
+  const { turns, notes, voice } = readTurns(session, options.maxToolNotes)
+
+  // The next-message prediction follows the agent's latest reply; a turn that produced
+  // only tool calls, or none yet, has no reply to follow up on.
+  if (mode === 'next' && (turns.length === 0 || turns.at(-1).reply === '')) return null
+
+  const kept = turns.slice(-Math.max(1, Math.ceil(options.maxMessages / 2)))
+  const latest = kept.at(-1)
+  const latestBudget = Math.min(LATEST_REPLY_CHARS, Math.floor(options.maxChars / 2))
+  let budget = options.maxChars - latestBudget
+  const older = []
+  for (let index = kept.length - 2; index >= 0; index -= 1) {
+    const user = clipMiddle(kept[index].user, 300, 200)
+    const reply = clipMiddle(kept[index].reply, 350, 350)
+    if (user.length + reply.length > budget) break
+    budget -= user.length + reply.length
+    older.unshift({ user, reply })
   }
 
-  const lines = ['Conversation tail (oldest first):', JSON.stringify(kept)]
-  const recent = limits.notes > 0 ? notes.slice(-limits.notes) : []
-  if (recent.length > 0) {
-    lines.push('', 'Recent tool activity (oldest first):')
-    for (const note of recent) {
+  const lines = ['<conversation>']
+  for (const turn of older) {
+    if (turn.user !== '') lines.push('[user]', turn.user)
+    if (turn.reply !== '') lines.push('[agent]', turn.reply)
+  }
+  if (latest !== undefined) {
+    if (latest.user !== '') lines.push('[user]', clipMiddle(latest.user, 500, 300))
+    if (latest.reply !== '') {
+      lines.push('[agent, latest reply]', clipMiddle(latest.reply, Math.floor(latestBudget * 0.3), Math.ceil(latestBudget * 0.7)))
+    }
+  }
+  lines.push('</conversation>')
+
+  if (notes.length > 0) {
+    lines.push('', `${TOOLS_LABEL}:`)
+    for (const note of notes) {
       const status = note.failed ? 'failed' : 'ok'
       const result = note.result === '' ? '' : ` result=${JSON.stringify(clip(note.result, 320))}`
       lines.push(`- ${note.name}(${clip(note.input, 320)}) -> ${status}${result}`)
     }
+  }
+
+  const shown = new Set(kept.map((turn) => turn.user))
+  const samples = voice.filter((text) => !shown.has(text)).slice(-VOICE_SAMPLES)
+  if (samples.length > 0) {
+    lines.push('', `${VOICE_LABEL}:`)
+    for (const sample of samples) lines.push(`- ${clip(sample.replace(/\s+/gu, ' '), VOICE_SAMPLE_CHARS)}`)
   }
 
   if (mode === 'continue') {
@@ -542,7 +655,7 @@ function buildPrompt(session, options, mode, draft, images = { count: 0, visible
         : `The user attached ${images.count} ${noun} that you cannot see; rely on the text alone.`)
     }
     if (draft.trim() === '' && images.count > 0) lines.push('', 'The draft is empty.', '', IMAGE_ONLY_CUE)
-    else lines.push('', 'Draft text ending at the caret:', JSON.stringify(draft), '', CONTINUE_CUE)
+    else lines.push('', `${DRAFT_LABEL}:`, JSON.stringify(draft), '', CONTINUE_CUE)
   } else {
     lines.push('', NEXT_CUE)
   }
@@ -622,6 +735,12 @@ function clip(text, maximum) {
   return text.length > maximum ? `${text.slice(0, maximum)}…` : text
 }
 
+/** Keep the start and the end of a long text, marking the cut. */
+function clipMiddle(text, head, tail) {
+  if (text.length <= head + tail) return text
+  return `${text.slice(0, head).trimEnd()}\n[…]\n${text.slice(-tail).trimStart()}`
+}
+
 /** Shortest piece, in characters, a packed line may be split into. */
 const MIN_PACKED_PIECE = 4
 
@@ -655,7 +774,7 @@ function normalizeCandidates(text, maximum, draft, cue = '') {
       .replace(/^(?:[-*•]|\d+[.)])\s+/u, '')
       .replace(/^user\s*:\s*/iu, '')
       .trim()
-    if (line === '') continue
+    if (line === '' || PROMPT_MARKER.test(line)) continue
 
     let body = line
       .replace(/^["'`\u201c\u201d]+|["'`\u201c\u201d]+$/gu, '')
@@ -804,4 +923,4 @@ function timedSignal(signal, timeoutMs) {
 }
 
 /** Pure helpers exposed for the unit tests only. */
-export const __testing = { ENDPOINT, resolveOptions, resolveRoute, finishFailure, selectEffort, buildPrompt, normalizeCandidates, parseImages }
+export const __testing = { ENDPOINT, NEXT_SYSTEM_PROMPT, CONTINUE_SYSTEM_PROMPT, resolveOptions, resolveRoute, finishFailure, selectEffort, buildPrompt, normalizeCandidates, parseImages }

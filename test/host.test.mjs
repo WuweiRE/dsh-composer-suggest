@@ -199,8 +199,13 @@ test('next mode streams, returns cleaned candidates, and reports the route and s
   assert.equal(done.seq, 7)
   assert.equal(done.cached, false)
   assert.equal(typeof done.ms, 'number')
-  assert.match(harness.llmCalls[0].request.system, /follow-up suggestion engine/)
-  assert.match(harness.llmCalls[0].request.messages[0].content[0].text, /Conversation tail/)
+  const system = harness.llmCalls[0].request.system
+  assert.match(system, /predict what a user will type next/)
+  assert.match(system, /Write 3 messages this user could send right now/)
+  assert.doesNotMatch(system, /\{max\}/)
+  const prompt = harness.llmCalls[0].request.messages[0].content[0].text
+  assert.match(prompt, /^<conversation>\n\[user\]\nThe build is failing on the new test\.\n\[agent, latest reply\]\nThe failure is in test\/parser\.test\.ts/)
+  assert.match(prompt, /Write the messages this user could send next\.$/)
 })
 
 test('results are cached by session sequence, mode and draft', async () => {
@@ -235,8 +240,9 @@ test('continue mode sends the draft and keeps the leading separator', async () =
   const prompt = harness.llmCalls[0].request.messages[0].content[0].text
   assert.match(prompt, /Draft text ending at the caret/)
   assert.match(prompt, /"Can you also"/)
-  assert.match(prompt, /Write only the continuation text\./)
-  assert.match(harness.llmCalls[0].request.system, /complete the message a USER is drafting/)
+  assert.match(prompt, /Write the endings for the draft\.$/)
+  assert.match(harness.llmCalls[0].request.system, /finish a message that a user has started typing/)
+  assert.match(harness.llmCalls[0].request.system, /write 3 different endings/)
 })
 
 test('continue mode strips a restated draft prefix', async () => {
@@ -255,7 +261,7 @@ test('a configured model is used even when the Session runs on another model, at
   const call = harness.llmCalls[0]
   assert.equal(call.config.provider, 'claude2')
   assert.equal(call.config.model, 'claude-sonnet-5-5')
-  assert.equal(call.config.maxTokens, 1024)
+  assert.equal(call.config.maxTokens, 2048)
   assert.equal(call.controls.reasoningEffort, 'low')
   assert.equal('temperature' in call.controls, false)
   assert.equal(call.request.reasoningEffort ?? 'low', 'low')
@@ -562,8 +568,107 @@ test('prompt includes recent tool activity and marks failures', async () => {
   ]))
   await callRoute(harness, { sessionId: 's1' })
   const prompt = harness.llmCalls[0].request.messages[0].content[0].text
-  assert.match(prompt, /Recent tool activity/)
+  assert.match(prompt, /Tools the agent ran in the latest turn/)
   assert.match(prompt, /bash\(.*npm test.*\) -> failed/)
+})
+
+function injected(kind, value) {
+  return { role: 'user', source: { kind }, content: [{ type: 'text', text: value }] }
+}
+
+test('context the Harness injects under the user role is not shown as something the user said', async () => {
+  const harness = makeHarness({ reply: 'go' })
+  harness.sessions.set('s1', makeSession([
+    { role: 'user', source: { kind: 'user', rpcId: 'r1' }, content: [{ type: 'text', text: 'rename the config file' }] },
+    injected('agent-instructions', '<system-reminder>WORKSPACE-RULES</system-reminder>'),
+    injected('runtime-context', 'Current runtime context. RUNTIME-SNAPSHOT'),
+    injected('skill-catalog', '<system-reminder>SKILL-CATALOG</system-reminder>'),
+    injected('time-context', 'Time sampled while preparing turn 1: TIME-SNAPSHOT'),
+    text('assistant', 'Looking for references first.'),
+    injected('tool-jobs', 'background job bash-1 finished JOB-NOTICE'),
+    injected('agent-message', 'Team message from lead: TEAM-RELAY'),
+    injected('compact-checkpoint', 'This is an automatically generated checkpoint CHECKPOINT'),
+    text('assistant', 'Renamed config.yml to settings.yml and updated two imports.'),
+  ]))
+  await callRoute(harness, { sessionId: 's1' })
+  const prompt = harness.llmCalls[0].request.messages[0].content[0].text
+  for (const marker of ['WORKSPACE-RULES', 'RUNTIME-SNAPSHOT', 'SKILL-CATALOG', 'TIME-SNAPSHOT', 'JOB-NOTICE', 'TEAM-RELAY', 'CHECKPOINT']) {
+    assert.doesNotMatch(prompt, new RegExp(marker), `${marker} is injected context, not conversation`)
+  }
+  assert.match(prompt, /\[user\]\nrename the config file\n\[agent, latest reply\]\nRenamed config\.yml/)
+  // Narration written between tool calls is not the reply the user is answering.
+  assert.doesNotMatch(prompt, /Looking for references first/)
+})
+
+test('a long latest reply keeps its ending, where the open question is', async () => {
+  const reply = `START-OF-REPLY ${'detail '.repeat(1200)}Should I also update the changelog? END-OF-REPLY`
+  const harness = makeHarness({ reply: 'go' })
+  harness.sessions.set('s1', makeSession([text('user', 'ship it'), text('assistant', reply)]))
+  await callRoute(harness, { sessionId: 's1' })
+  const prompt = harness.llmCalls[0].request.messages[0].content[0].text
+  assert.ok(reply.length > 8000)
+  assert.match(prompt, /START-OF-REPLY/)
+  assert.match(prompt, /Should I also update the changelog\? END-OF-REPLY/)
+  assert.match(prompt, /\n\[…\]\n/, 'the cut is marked')
+  assert.ok(prompt.length < 8000 + 500, 'the prompt stays within the configured budget')
+})
+
+test('older turns are background: both ends of a long old reply survive, and tools are listed for the latest turn only', async () => {
+  const harness = makeHarness({ reply: 'go' })
+  harness.sessions.set('s1', makeSession([
+    text('user', 'first task'),
+    toolCall('old', 'bash', { command: 'OLD-COMMAND' }),
+    toolResult('old', 'old output'),
+    text('assistant', `OLD-HEAD ${'filler '.repeat(300)}OLD-TAIL`),
+    text('user', 'second task'),
+    toolCall('new', 'bash', { command: 'NEW-COMMAND' }),
+    toolResult('new', 'new output'),
+    text('assistant', 'Second task is done.'),
+  ]))
+  await callRoute(harness, { sessionId: 's1' })
+  const prompt = harness.llmCalls[0].request.messages[0].content[0].text
+  assert.match(prompt, /OLD-HEAD/)
+  assert.match(prompt, /OLD-TAIL/)
+  assert.match(prompt, /NEW-COMMAND/)
+  assert.doesNotMatch(prompt, /OLD-COMMAND/)
+  assert.ok(prompt.indexOf('[agent]\nOLD-HEAD') < prompt.indexOf('[agent, latest reply]\nSecond task is done.'))
+})
+
+test('earlier user messages are quoted as a sample of how the user writes', async () => {
+  const history = []
+  for (let index = 0; index < 9; index += 1) {
+    history.push(text('user', `terse ask ${index}`))
+    history.push(text('assistant', `answer ${index}`))
+  }
+  const harness = makeHarness({ reply: 'go' })
+  harness.sessions.set('s1', makeSession(history))
+  await callRoute(harness, { sessionId: 's1' })
+  const prompt = harness.llmCalls[0].request.messages[0].content[0].text
+  const [transcript, samples] = prompt.split('Earlier messages from this user, only to show how they write:')
+  // Five turns are shown as conversation; the four before them are only quoted.
+  assert.match(transcript, /\[user\]\nterse ask 4\n/)
+  assert.doesNotMatch(transcript, /terse ask 3/)
+  assert.match(samples, /- terse ask 0\n- terse ask 1\n- terse ask 2\n- terse ask 3\n/)
+  assert.doesNotMatch(samples, /terse ask 4/)
+
+  const short = makeHarness({ reply: 'go' })
+  short.sessions.set('s1', makeSession(CONVERSATION))
+  await callRoute(short, { sessionId: 's1' })
+  assert.doesNotMatch(short.llmCalls[0].request.messages[0].content[0].text, /Earlier messages from this user/)
+})
+
+test('next mode declines when the latest turn has produced tool calls but no reply', async () => {
+  const harness = makeHarness()
+  harness.sessions.set('s1', makeSession([
+    text('user', 'first'),
+    text('assistant', 'done with the first'),
+    text('user', 'second'),
+    toolCall('c1', 'bash', { command: 'ls' }),
+    toolResult('c1', 'a b c'),
+  ]))
+  const events = sseEvents(await callRoute(harness, { sessionId: 's1' }))
+  assert.equal(events.at(-1).reason, 'no-conversation')
+  assert.equal(harness.llmCalls.length, 0)
 })
 
 test('next mode declines when the agent has not replied yet', async () => {
@@ -579,10 +684,25 @@ test('NONE and echoed instructions produce no suggestion', async () => {
   const harness = makeHarness({ reply: 'NONE' })
   harness.sessions.set('s1', makeSession(CONVERSATION))
   assert.equal(sseEvents(await callRoute(harness, { sessionId: 's1' })).at(-1).reason, 'empty')
-  harness.setReply("Predict the user's next message.\nConversation tail (oldest first):")
+  harness.setReply([
+    'Write the messages this user could send next.',
+    '<conversation>',
+    '[user]',
+    '[agent, latest reply]',
+    '[…]',
+    '</conversation>',
+    'Tools the agent ran in the latest turn (oldest first):',
+    'Earlier messages from this user, only to show how they write:',
+    'Draft text ending at the caret:',
+  ].join('\n'))
   const session = harness.sessions.get('s1')
   session.seq = 2
   assert.equal(sseEvents(await callRoute(harness, { sessionId: 's1' })).at(-1).reason, 'empty')
+
+  // A real suggestion among echoed scaffolding still gets through, and a bracketed word is not scaffolding.
+  harness.setReply('[agent, latest reply]\n[WIP] rename the flag\nWrite the endings for the draft.')
+  session.seq = 3
+  assert.deepEqual(sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'continue', draft: 'please' })).at(-1).items, ['[WIP] rename the flag'])
 })
 
 test('a max-tokens finish keeps whole lines and drops the cut-off one', async () => {

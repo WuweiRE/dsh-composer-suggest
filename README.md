@@ -30,6 +30,25 @@ Composer suggestions for the DeepSeek Harness Web UI.
 Every suggestion is one model call and uses tokens. It is not written to the Session
 log and does not show in the token meter.
 
+## What the model is shown
+
+- The last five turns: what you typed and the agent's final reply to it. The latest reply
+  is sent nearly whole (up to 3200 characters, keeping its ending when it must be cut);
+  older turns are shortened to their first and last few hundred characters.
+- The tool calls of the latest turn, up to six, each with a clipped result.
+- Up to five of your earlier messages from the same Session, 140 characters each, so the
+  suggestions match how you write.
+- In continuation mode, your draft and up to three attached images.
+
+Context the Harness adds for the agent (workspace instructions, runtime and time
+snapshots, the skill catalog, reminders, background-job and teammate notices) is left
+out, as is the agent's narration between tool calls.
+
+The candidates are asked to be different moves, not three wordings of one: for example
+approving, picking the other option, reporting what happened when you tried it, or asking
+about one claim. The prompts were tuned on deepseek-flash by replaying real sessions and
+comparing against what was actually typed next.
+
 ## Install
 
 From a checkout:
