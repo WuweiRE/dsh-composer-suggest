@@ -1,7 +1,12 @@
 /**
  * Browser half of composer suggestions.
  *
- * Two modes share one overlay:
+ * Besides the two suggestion modes below, a toolbar button (or Alt+T) tidies the whole
+ * draft: the Host rewrites it into clear, ordered points, the draft is replaced in place,
+ * and a line under the composer offers to restore the original and names any concrete
+ * token the rewrite lost or added. See the "Tidy" section near the end of this file.
+ *
+ * Two suggestion modes share one overlay:
  * - `next`: after a turn settles and the composer is empty, the Host streams
  *   candidate follow-up messages as ghost text over the placeholder.
  * - `continue`: while the user pauses mid-draft with the caret at the end, the
@@ -108,7 +113,7 @@ window.__ModuleLoader__.load({
         model: 'Model for suggestions',
         modelHint: 'Leave empty to use the current session\'s model, or enter a model id such as claude-sonnet-5-5 to use that one instead. If no provider offers it, the status line below says so.',
         modelPlaceholder: 'Same as the session',
-        cost: 'Every suggestion is a model call and uses tokens. Images attached to a continuation are sent with it. Saved in this browser on this device.',
+        cost: 'Every suggestion and every tidy is a model call and uses tokens. Images attached to a continuation are sent with it. Saved in this browser on this device.',
         pending: 'Continuing…',
         statusIdle: 'No suggestion requested yet.',
         statusOk: 'Last suggestion: {route} · {ms} ms',
@@ -121,6 +126,33 @@ window.__ModuleLoader__.load({
         imagesUnseen: 'This model cannot see images; type some text to continue.',
         imagesUnavailable: 'The images could not be sent to the model.',
         ready: 'Suggestion: {text}. Press Tab to accept. Alt+Down or Alt+Up changes candidates. Escape dismisses.',
+        tidy: 'Tidy',
+        tidySetting: 'Tidy my draft',
+        tidyHint: 'A Tidy button appears in the composer toolbar once the draft is long enough; {key} does the same. The model rewrites the draft into clear, ordered points without changing what it says, and the draft is replaced in place, so read it before sending. Restore brings your original back. A draft with @ references cannot be tidied.',
+        tidyTooltip: 'Tidy this draft into clear points ({key})',
+        tidyWorking: 'Tidying…',
+        tidyEscCancel: 'to cancel',
+        tidyCancelTooltip: 'Tidying the draft. Click or press Esc to cancel.',
+        tidyRestore: 'Restore',
+        tidyRestoreTooltip: 'Restore the draft from before tidying',
+        tidyRestoreKeyTooltip: 'Restore the draft from before tidying ({key})',
+        tidyDone: 'Tidied. Check it before sending.',
+        tidyEmptied: 'The draft is empty. Your text from before tidying is still kept.',
+        tidyMissing: 'May be missing: {list}',
+        tidyAdded: 'Added, not in your original: {list}',
+        tidyDismiss: 'Dismiss',
+        tidyShort: 'This draft is short enough already.',
+        tidyChips: 'Tidying would drop the @ references in this draft, so it was left as it is.',
+        tidyTooLong: 'This draft is too long to tidy (over {max} characters).',
+        tidyStale: 'The draft changed while it was being tidied, so it was left as it is.',
+        tidySame: 'Nothing to tidy: the draft is already clear.',
+        tidyFailed: 'Tidying failed: {reason}. Your draft was not changed.',
+        tidyWhyTruncated: 'the result was cut off',
+        tidyWhyOffTrack: 'the model did not return a rewrite',
+        tidyWhyEmpty: 'the model returned nothing',
+        tidyWhyNetwork: 'the connection was lost',
+        tidyWhyModel: 'no model is available for it',
+        tidyWhyLocked: 'the composer cannot be edited right now',
       },
       zh: {
         label: '输入建议',
@@ -134,7 +166,7 @@ window.__ModuleLoader__.load({
         model: '建议使用的模型',
         modelHint: '留空则使用当前会话的模型；填写模型 ID（如 claude-sonnet-5-5）则改用该模型。找不到时，下方状态行会提示。',
         modelPlaceholder: '与会话相同',
-        cost: '每次建议都会调用一次模型并消耗 token。续写时会把附上的图片一并发送。设置保存在当前设备的浏览器中。',
+        cost: '每次建议和每次整理都会调用一次模型并消耗 token。续写时会把附上的图片一并发送。设置保存在当前设备的浏览器中。',
         pending: '正在续写…',
         statusIdle: '尚未请求过建议。',
         statusOk: '上次建议：{route} · {ms} ms',
@@ -147,16 +179,43 @@ window.__ModuleLoader__.load({
         imagesUnseen: '当前模型看不到图片，请先输入文字再续写。',
         imagesUnavailable: '图片未能发给模型。',
         ready: '建议：{text}。按 Tab 采纳，Alt+↓ 或 Alt+↑ 切换，Escape 关闭。',
+        tidy: '整理',
+        tidySetting: '整理我的草稿',
+        tidyHint: '草稿够长时，输入框工具栏会出现“整理”按钮，按 {key} 也可以。模型把草稿改写成清楚、有顺序的要点，不改变原意，并直接替换草稿，发送前请核对；点“还原”可以回到原文。带 @ 引用的草稿不能整理。',
+        tidyTooltip: '把这段草稿整理成清楚的要点（{key}）',
+        tidyWorking: '整理中…',
+        tidyEscCancel: '取消',
+        tidyCancelTooltip: '正在整理草稿，点击或按 Esc 取消。',
+        tidyRestore: '还原',
+        tidyRestoreTooltip: '还原整理前的草稿',
+        tidyRestoreKeyTooltip: '还原整理前的草稿（{key}）',
+        tidyDone: '已整理，发送前请核对。',
+        tidyEmptied: '草稿已清空，整理前的原文还保留着。',
+        tidyMissing: '可能遗漏：{list}',
+        tidyAdded: '新增（原文没有）：{list}',
+        tidyDismiss: '关闭',
+        tidyShort: '草稿已经够短，不需要整理。',
+        tidyChips: '整理会丢掉草稿里的 @ 引用，所以没有改动。',
+        tidyTooLong: '草稿太长，无法整理（超过 {max} 字）。',
+        tidyStale: '整理期间草稿有改动，所以没有替换。',
+        tidySame: '草稿已经很清楚，没有改动。',
+        tidyFailed: '整理失败：{reason}。草稿未改动。',
+        tidyWhyTruncated: '结果被截断',
+        tidyWhyOffTrack: '模型没有按要求改写',
+        tidyWhyEmpty: '模型没有返回内容',
+        tidyWhyNetwork: '连接中断',
+        tidyWhyModel: '没有可用的模型',
+        tidyWhyLocked: '输入框当前不能修改',
       },
     }
 
     const PREFERENCE_KEY = 'dsh-composer-suggest.prefs'
-    /** Both modes are on, and the Session's own model answers, until the user says otherwise. */
-    const DEFAULT_PREFS = { next: true, continue: true, model: '' }
+    /** Every feature is on, and the Session's own model answers, until the user says otherwise. */
+    const DEFAULT_PREFS = { next: true, continue: true, tidy: true, model: '' }
     function parsePrefs(stored) {
       if (stored === null || typeof stored !== 'object') return DEFAULT_PREFS
       const model = typeof stored.model === 'string' ? stored.model.trim().slice(0, MAX_MODEL_CHARS) : ''
-      return { next: stored.next !== false, continue: stored.continue !== false, model }
+      return { next: stored.next !== false, continue: stored.continue !== false, tidy: stored.tidy !== false, model }
     }
     let prefs = DEFAULT_PREFS
     try {
@@ -279,6 +338,7 @@ window.__ModuleLoader__.load({
         h('style', null, SWITCH_CSS),
         h(SettingRow, { title: t('next'), hint: t('nextHint'), checked: current.next, onChange: (value) => setPref('next', value) }),
         h(SettingRow, { title: t('continue'), hint: t('continueHint'), checked: current.continue, onChange: (value) => setPref('continue', value) }),
+        h(SettingRow, { title: t('tidySetting'), hint: t('tidyHint').replace('{key}', TIDY_KEY_LABEL), checked: current.tidy, onChange: (value) => setPref('tidy', value) }),
         h(ModelField, {
           title: t('model'),
           hint: t('modelHint'),
@@ -1319,10 +1379,394 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * Tidy: rewrite the whole draft in place, and keep the original for one restore.
+     *
+     * State lives outside React, one record per Session, because two seats show it: the button
+     * in the composer toolbar and the line under the composer card.
+     *   idle     nothing in flight; `notice` holds a short message that clears itself
+     *   working  the Host is rewriting `draft`; `controller` cancels it, and `previous` is the
+     *            finished result that cancelling goes back to, when there was one
+     *   done     the composer holds `tidied`; `original` is what Restore puts back, `missing`
+     *            and `added` are the concrete tokens the Host could not match, and `emptied`
+     *            marks that the composer was emptied since (by Undo, most likely)
+     *
+     * The line's seat exists only in an ongoing conversation. A new Session's composer has the
+     * toolbar seat alone, so when no line is mounted the button's seat shows the same status.
+     */
+    const TIDY_RIGHT_SLOT = 'conversation.input.right'
+    const TIDY_DOCK_SLOT = 'conversation.composer.dock'
+    /** Below this a draft has nothing to reorganize; the button also stays hidden until twice this. */
+    const TIDY_MIN_CHARS = 20
+    const TIDY_SHOW_CHARS = 40
+    /** The Host refuses a longer draft: it rewrites the draft whole and never clips it. */
+    const TIDY_MAX_CHARS = 4_000
+    /** A refusal is read once and leaves; a failure stays a little longer. */
+    const TIDY_NOTICE_MS = 6_000
+    const TIDY_ERROR_MS = 12_000
+    /** A double click must not start a rewrite and cancel it in one gesture. */
+    const TIDY_CLICK_GUARD_MS = 400
+    const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/u.test(String(navigator.platform || navigator.userAgent || ''))
+    const TIDY_KEY_LABEL = IS_MAC ? '⌥T' : 'Alt+T'
+
+    /** Sizes and weights follow the Host's own toolbar selectors and the meter under the composer. */
+    const TIDY_CSS = [
+      '.cs-tidy{display:inline-flex;align-items:center;gap:4px;flex:none;height:30px;padding:0 8px;border:none;border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;font-weight:500;line-height:20px;white-space:nowrap;cursor:pointer}',
+      '.cs-tidy:hover{background:var(--dsw-alias-interactive-bg-hover,var(--dsw-alias-bg-layer-2));color:var(--dsw-alias-label-primary)}',
+      '.cs-tidy:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,var(--dsw-alias-brand-primary));outline-offset:1px}',
+      '.cs-tidy svg{flex:none}',
+      '.cs-tidy .cs-spin{margin:0 2px}',
+      '@container (max-width:560px){.cs-tidy__label{display:none}}',
+      '.cs-tidy-line{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:2px 8px;max-width:100%;font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));color:var(--dsw-alias-label-secondary)}',
+      '.cs-tidy-inline{display:inline-flex;align-items:center;gap:6px;flex:0 1 auto;min-width:0;max-width:340px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary);white-space:nowrap}',
+      '.cs-tidy-inline>span{min-width:0;overflow:hidden;text-overflow:ellipsis}',
+      // Text needs the label shade of the warning colour; the primary shade is for fills.
+      '.cs-tidy-status__warn{color:var(--dsw-alias-state-warn-label,var(--dsw-alias-state-warn-primary));overflow-wrap:anywhere}',
+      '.cs-tidy-status__error{color:var(--dsw-alias-state-error-primary);overflow-wrap:anywhere}',
+      // The Host's action colour; its brand token resolves to ink in the composer.
+      '.cs-tidy-status__act{flex:none;padding:0 6px;border:none;border-radius:4px;background:transparent;color:var(--dsw-alias-state-business-primary,var(--dsw-alias-label-primary));font:inherit;cursor:pointer}',
+      '.cs-tidy-status__act:hover{text-decoration:underline}',
+      '.cs-tidy-status__act:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,var(--dsw-alias-brand-primary));outline-offset:1px}',
+      '.cs-tidy-status__x{color:var(--dsw-alias-label-secondary)}',
+    ].join('')
+
+    const IDLE_TIDY = Object.freeze({ phase: 'idle' })
+    const tidyStates = new Map()
+    const tidyListeners = new Set()
+    const subscribeTidy = (listener) => {
+      tidyListeners.add(listener)
+      return () => tidyListeners.delete(listener)
+    }
+    const notifyTidy = () => {
+      for (const listener of tidyListeners) listener()
+    }
+    const readTidy = (sessionId) => tidyStates.get(sessionId) ?? IDLE_TIDY
+    function setTidy(sessionId, next) {
+      if (next.phase === 'idle' && next.notice === undefined) tidyStates.delete(sessionId)
+      else tidyStates.set(sessionId, next)
+      notifyTidy()
+    }
+    function useTidy(sessionId) {
+      const read = () => readTidy(sessionId)
+      return React.useSyncExternalStore(subscribeTidy, read, read)
+    }
+
+    /** How many lines are mounted for a Session: none in a new Session's composer. */
+    const tidyLines = new Map()
+    function mountTidyLine(sessionId) {
+      tidyLines.set(sessionId, (tidyLines.get(sessionId) ?? 0) + 1)
+      notifyTidy()
+      return () => {
+        const left = (tidyLines.get(sessionId) ?? 1) - 1
+        if (left > 0) tidyLines.set(sessionId, left)
+        else tidyLines.delete(sessionId)
+        notifyTidy()
+      }
+    }
+    function useTidyLineMounted(sessionId) {
+      const read = () => tidyLines.has(sessionId)
+      return React.useSyncExternalStore(subscribeTidy, read, read)
+    }
+
+    /** The editor may hand back other line endings or trailing blanks than it was given. */
+    const sameDraft = (left, right) =>
+      typeof left === 'string' && typeof right === 'string' && left.replace(/\r\n?/gu, '\n').trim() === right.replace(/\r\n?/gu, '\n').trim()
+
+    const tokenList = (value) => (Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item !== '').slice(0, 6) : [])
+
+    /**
+     * Ask the Host to rewrite the draft and put the answer in the composer.
+     * @param input - `{ draft, chips, phase, readDraft }`: the draft as it is now, how many
+     *   reference chips it holds, the composer's submit phase, and a reader for the draft at
+     *   the moment the answer arrives.
+     */
+    async function runTidy(sessionId, input, inputActions) {
+      if (sessionId === undefined || sessionId === null) return
+      if (readTidy(sessionId).phase === 'working') return
+      // While a message is being sent the editor is read-only.
+      if (input.phase !== undefined && input.phase !== 'plain') return
+      const draft = input.draft
+      const note = (key, extra = {}) => setTidy(sessionId, { phase: 'idle', notice: { key, ...extra } })
+      if (draft.trim() === '') return
+      // The only way to write a rewrite back replaces the whole draft as plain text.
+      if (input.chips > 0) return note('tidyChips')
+      if (draft.trim().length < TIDY_MIN_CHARS) return note('tidyShort')
+      if (draft.length > TIDY_MAX_CHARS) return note('tidyTooLong')
+
+      const controller = new AbortController()
+      // Tidying again after editing a tidied draft: a cancel must not cost the earlier Restore.
+      const before = readTidy(sessionId)
+      setTidy(sessionId, { phase: 'working', controller, draft, startedAt: Date.now(), previous: before.phase === 'done' ? before : undefined })
+      const fail = (reason) => {
+        if (controller.signal.aborted) return
+        if (reason === 'draft-too-long') return note('tidyTooLong')
+        reportStatus({ state: 'error', reason })
+        note('tidyFailed', { reason, level: 'error' })
+      }
+      try {
+        const payload = prefs.model === '' ? { sessionId, mode: 'tidy', draft } : { sessionId, mode: 'tidy', draft, model: prefs.model }
+        const response = await fetch(ENDPOINT, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        })
+        if (controller.signal.aborted) return
+        if (!response.ok) return fail('HTTP ' + response.status)
+        if (!(response.headers.get('content-type') || '').includes('text/event-stream')) {
+          const refused = await response.json().catch(() => null)
+          return fail(typeof refused?.reason === 'string' && refused.reason !== '' ? refused.reason : 'error')
+        }
+        let last
+        if (response.body === null) {
+          last = parseSseText(await response.text().catch(() => '')).find((event) => event.type === 'done' || event.type === 'error')
+        } else {
+          await consumeStream(response.body, controller.signal, (event) => {
+            if (event.type === 'done' || event.type === 'error') last = event
+          })
+        }
+        if (controller.signal.aborted) return
+        if (last === undefined) return fail('stream-ended')
+        if (last.type === 'error') return fail(typeof last.reason === 'string' && last.reason !== '' ? last.reason : 'error')
+        const tidied = typeof last.text === 'string' ? last.text : ''
+        if (tidied.trim() === '') return fail('empty')
+        // The user kept typing: their newer text wins over a rewrite of the older one.
+        if (input.readDraft() !== draft) return note('tidyStale')
+        if (sameDraft(tidied, draft)) return note('tidySame')
+        try {
+          inputActions.setDraft(tidied)
+        } catch {
+          return fail('replace-refused')
+        }
+        const route = describeRoute(last.route)
+        reportStatus(last.cached === true ? { state: 'cached', route } : { state: 'ok', route, ms: Number(last.ms) || 0 })
+        setTidy(sessionId, { phase: 'done', original: draft, tidied, missing: tokenList(last.missing), added: tokenList(last.added) })
+      } catch {
+        fail('network')
+      }
+    }
+
+    function cancelTidy(sessionId) {
+      const current = readTidy(sessionId)
+      if (current.phase !== 'working') return
+      current.controller.abort()
+      setTidy(sessionId, current.previous ?? IDLE_TIDY)
+    }
+
+    /** Put the pre-tidy draft back. The original is dropped only once it is back in the editor. */
+    function restoreTidy(sessionId, inputActions) {
+      const current = readTidy(sessionId)
+      if (current.phase !== 'done') return false
+      try {
+        inputActions.setDraft(current.original)
+      } catch {
+        return false
+      }
+      setTidy(sessionId, IDLE_TIDY)
+      return true
+    }
+
+    /** Drop a finished result or a notice, but only the one the caller saw. */
+    function dismissTidy(sessionId, seen) {
+      const current = readTidy(sessionId)
+      if (current.phase === 'working') return
+      if (seen !== undefined && seen !== current) return
+      setTidy(sessionId, IDLE_TIDY)
+    }
+
+    /** Whether the main button, and Alt+T, would restore right now instead of tidying. */
+    const tidyRestores = (state, draft) => state.phase === 'done' && (sameDraft(draft, state.tidied) || draft.trim() === '')
+
+    /** The Host's reason codes, said the way a person would; an unknown one is shown as it is. */
+    const TIDY_REASONS = {
+      'tidy-truncated': 'tidyWhyTruncated',
+      'tidy-off-track': 'tidyWhyOffTrack',
+      empty: 'tidyWhyEmpty',
+      'stream-ended': 'tidyWhyNetwork',
+      network: 'tidyWhyNetwork',
+      'no-route': 'tidyWhyModel',
+      'model-unavailable': 'tidyWhyModel',
+      'replace-refused': 'tidyWhyLocked',
+    }
+    function tidyNoticeText(notice, t) {
+      const key = TIDY_REASONS[notice.reason]
+      const reason = key === undefined ? notice.reason ?? '' : t(key)
+      return t(notice.key).replace('{reason}', reason).replace('{max}', String(TIDY_MAX_CHARS))
+    }
+
+    /**
+     * What both seats say about the current state, as elements; `null` when there is nothing to say.
+     * @param inline - the toolbar copy: the button next to it already shows that work is in flight.
+     */
+    function tidyStatus(sessionId, tidy, inputActions, t, inline) {
+      const keep = (event) => event.preventDefault()
+      if (tidy.phase === 'working') {
+        if (inline) return null
+        return [h('span', null, t('tidyWorking')), h('kbd', { style: { ...KEYCAP_STYLE, marginLeft: 0 } }, 'Esc'), h('span', null, t('tidyEscCancel'))]
+      }
+      if (tidy.phase === 'done') {
+        return [
+          h('span', null, t(tidy.emptied === true ? 'tidyEmptied' : 'tidyDone')),
+          tidy.missing.length > 0 ? h('span', { className: 'cs-tidy-status__warn' }, t('tidyMissing').replace('{list}', tidy.missing.join('、'))) : null,
+          tidy.added.length > 0 ? h('span', { className: 'cs-tidy-status__warn' }, t('tidyAdded').replace('{list}', tidy.added.join('、'))) : null,
+          h('button', { type: 'button', className: 'cs-tidy-status__act', title: t('tidyRestoreTooltip'), onMouseDown: keep, onClick: () => restoreTidy(sessionId, inputActions) }, t('tidyRestore')),
+          h('button', { type: 'button', className: 'cs-tidy-status__act cs-tidy-status__x', 'aria-label': t('tidyDismiss'), title: t('tidyDismiss'), onMouseDown: keep, onClick: () => dismissTidy(sessionId, tidy) }, '×'),
+        ]
+      }
+      if (tidy.notice === undefined) return null
+      const text = tidyNoticeText(tidy.notice, t)
+      return [h('span', { className: tidy.notice.level === 'error' ? 'cs-tidy-status__error' : undefined, title: inline ? text : undefined }, text)]
+    }
+
+    const TIDY_ICON = h('svg', { viewBox: '0 0 16 16', width: 14, height: 14, 'aria-hidden': 'true' },
+      h('path', { d: 'M2.5 4h1.2M2.5 8h1.2M2.5 12h1.2M6 4h7.5M6 8h7.5M6 12h5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round' }))
+    const RESTORE_ICON = h('svg', { viewBox: '0 0 16 16', width: 14, height: 14, 'aria-hidden': 'true' },
+      h('path', { d: 'M5.5 3.5 3 6l2.5 2.5M3.2 6h6.3a3.5 3.5 0 0 1 0 7H6.5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }))
+
+    /**
+     * Toolbar seat: the button, the keyboard (Alt+T to tidy or restore, Esc to cancel), the
+     * state's own housekeeping, and the status itself wherever no line is mounted to show it.
+     */
+    function TidyButton(props) {
+      const { sessionId, useInput, inputActions, t } = props
+      const enabled = usePrefs().tidy
+      const draft = useInput((state) => (state === undefined ? '' : state.draft || ''))
+      const chips = useInput((state) => (state === undefined || !Array.isArray(state.occurrences) ? 0 : state.occurrences.length))
+      const phase = useInput((state) => (state === undefined || typeof state.phase !== 'string' ? 'plain' : state.phase))
+      const tidy = useTidy(sessionId)
+      const lineMounted = useTidyLineMounted(sessionId)
+      const anchorRef = React.useRef(null)
+      const draftRef = React.useRef(draft)
+      draftRef.current = draft
+
+      // Reached while working only by a click: the keyboard cancels with Escape instead.
+      const act = () => {
+        const current = readTidy(sessionId)
+        if (current.phase === 'working') {
+          if (Date.now() - current.startedAt < TIDY_CLICK_GUARD_MS) return
+          cancelTidy(sessionId)
+        } else if (tidyRestores(current, draftRef.current)) restoreTidy(sessionId, inputActions)
+        else void runTidy(sessionId, { draft: draftRef.current, chips, phase, readDraft: () => draftRef.current }, inputActions)
+      }
+      const actRef = React.useRef(act)
+      actRef.current = act
+
+      // A message on its way out takes the draft with it: there is nothing left to restore over.
+      React.useEffect(() => {
+        if (tidy.phase === 'done' && phase !== 'plain') dismissTidy(sessionId, tidy)
+      }, [sessionId, phase, tidy])
+
+      // An emptied composer keeps the original. The Host folds the replacement into the edit
+      // before it, so one Undo can empty the composer, and Redo only brings the tidied text back.
+      // The offer ends once the user starts a different draft.
+      React.useEffect(() => {
+        if (tidy.phase !== 'done') return
+        const empty = draft.trim() === ''
+        if (empty && tidy.emptied !== true) setTidy(sessionId, { ...tidy, emptied: true })
+        else if (!empty && tidy.emptied === true) {
+          if (sameDraft(draft, tidy.tidied)) setTidy(sessionId, { ...tidy, emptied: undefined })
+          else dismissTidy(sessionId, tidy)
+        }
+      }, [sessionId, draft, tidy])
+
+      // A refusal or failure is read once; it then leaves.
+      React.useEffect(() => {
+        if (tidy.phase !== 'idle' || tidy.notice === undefined) return undefined
+        const timer = setTimeout(() => dismissTidy(sessionId, tidy), tidy.notice.level === 'error' ? TIDY_ERROR_MS : TIDY_NOTICE_MS)
+        return () => clearTimeout(timer)
+      }, [sessionId, tidy])
+
+      // A composer that goes away must not have its draft replaced later.
+      React.useEffect(() => () => cancelTidy(sessionId), [sessionId])
+
+      React.useEffect(() => {
+        if (!enabled || sessionId === undefined || sessionId === null) return undefined
+        const onKeyDown = (event) => {
+          if (event.defaultPrevented) return
+          if (event.isComposing === true || event.keyCode === 229) return
+          const found = composerElementsNear(anchorRef.current)
+          if (found === null || !found.card.contains(document.activeElement)) return
+          const current = readTidy(sessionId)
+          if (event.key === 'Escape') {
+            if (current.phase !== 'working') return
+            // Cancel only the rewrite; the composer's own Escape handling is not for this press.
+            event.preventDefault()
+            event.stopPropagation()
+            cancelTidy(sessionId)
+            return
+          }
+          // Option+T types a dagger on macOS, so the physical key decides.
+          const isT = event.code === 'KeyT' || (event.code === undefined && typeof event.key === 'string' && event.key.toLowerCase() === 't')
+          if (!isT || !event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+          if (current.phase === 'idle' && draftRef.current.trim() === '') return
+          event.preventDefault()
+          event.stopPropagation()
+          if (current.phase === 'working') return
+          actRef.current()
+        }
+        document.addEventListener('keydown', onKeyDown, true)
+        return () => document.removeEventListener('keydown', onKeyDown, true)
+      }, [enabled, sessionId])
+
+      const anchor = h('span', { ref: anchorRef, 'data-composer-suggest-anchor': 'tidy', 'aria-hidden': 'true', style: { display: 'none' } })
+      if (!enabled) return anchor
+      const working = tidy.phase === 'working'
+      const status = lineMounted ? null : tidyStatus(sessionId, tidy, inputActions, t, true)
+      // The button is offered once there is enough text to reorganize, and stays while it has something to undo or cancel.
+      const shown = working || tidy.phase === 'done' || draft.trim().length >= TIDY_SHOW_CHARS
+      if (!shown && status === null) return anchor
+
+      const restores = tidyRestores(tidy, draft)
+      const label = working ? t('tidyWorking') : restores ? t('tidyRestore') : t('tidy')
+      const tooltip = working
+        ? t('tidyCancelTooltip')
+        : (restores ? t('tidyRestoreKeyTooltip') : t('tidyTooltip')).replace('{key}', TIDY_KEY_LABEL)
+      return h(React.Fragment, null,
+        anchor,
+        h('style', null, TIDY_CSS + SPIN_CSS),
+        status === null ? null : h('span', { className: 'cs-tidy-inline', role: 'status', 'aria-live': 'polite', 'data-composer-tidy-status': tidy.phase === 'idle' ? 'notice' : tidy.phase }, ...status),
+        shown
+          ? h('button',
+              {
+                type: 'button',
+                className: 'cs-tidy',
+                title: tooltip,
+                // The visible word first, so the name still reads when the label is collapsed.
+                'aria-label': `${label}. ${tooltip}`,
+                'aria-busy': working ? 'true' : undefined,
+                'data-composer-tidy': working ? 'working' : restores ? 'restore' : 'tidy',
+                // Keep the caret in the editor, like the Host's own toolbar buttons do.
+                onMouseDown: (event) => event.preventDefault(),
+                onClick: act,
+              },
+              working ? h('span', { className: 'cs-spin', 'aria-hidden': 'true' }) : restores ? RESTORE_ICON : TIDY_ICON,
+              h('span', { className: 'cs-tidy__label' }, label),
+            )
+          : null,
+      )
+    }
+
+    /** Dock seat, under the composer card: what just happened, and the way back. */
+    function TidyLine(props) {
+      const { sessionId, inputActions, t } = props
+      const enabled = usePrefs().tidy
+      const tidy = useTidy(sessionId)
+
+      // While this line is mounted the toolbar seat leaves the status to it.
+      React.useEffect(() => mountTidyLine(sessionId), [sessionId])
+
+      const status = enabled ? tidyStatus(sessionId, tidy, inputActions, t, false) : null
+      if (status === null) return null
+      return h('div', { className: 'cs-tidy-line', role: 'status', 'aria-live': 'polite', 'data-composer-tidy-status': tidy.phase === 'idle' ? 'notice' : tidy.phase },
+        h('style', null, TIDY_CSS),
+        ...status,
+      )
+    }
+
 
     return {
       inject: ['slots', 'locale'],
-      __testing: { caretAtEnd, joinContinuation, parseSseText, streamingCandidate, cleanLine, consumeStream, setPref, readPrefs, readStatus, reportStatus, describeRoute, dismissedSeqs, collectComposerImages, encodeComposerImages, dataUrlParts },
+      __testing: { caretAtEnd, joinContinuation, parseSseText, streamingCandidate, cleanLine, consumeStream, setPref, readPrefs, readStatus, reportStatus, describeRoute, dismissedSeqs, collectComposerImages, encodeComposerImages, dataUrlParts, tidy: { run: runTidy, cancel: cancelTidy, restore: restoreTidy, dismiss: dismissTidy, read: readTidy, sameDraft, keyLabel: TIDY_KEY_LABEL, clickGuardMs: TIDY_CLICK_GUARD_MS } },
       apply(ctx) {
         const t = ctx.locale.bind(NS)
         ctx.effect(() => ctx.locale.register(NS, DICTIONARIES))
@@ -1347,6 +1791,19 @@ window.__ModuleLoader__.load({
           ctx.slots.register(
             { name: SLOT, id: 'composer-suggest', order: 10, label: () => t('label') },
             (slotProps) => h(ComposerSuggest, { ...slotProps, t }),
+          ),
+        )
+        // Tidy: the button sits before the other compact controls, its result line under the card.
+        ctx.slots.inject(TIDY_RIGHT_SLOT, () =>
+          ctx.slots.register(
+            { name: TIDY_RIGHT_SLOT, id: 'composer-suggest-tidy', order: -20, label: () => t('tidy') },
+            (slotProps) => h(TidyButton, { ...slotProps, t }),
+          ),
+        )
+        ctx.slots.inject(TIDY_DOCK_SLOT, () =>
+          ctx.slots.register(
+            { name: TIDY_DOCK_SLOT, id: 'composer-suggest-tidy', order: -10, label: () => t('tidy') },
+            (slotProps) => h(TidyLine, { ...slotProps, t }),
           ),
         )
       },

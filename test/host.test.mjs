@@ -905,3 +905,205 @@ test('candidates are bounded, de-duplicated and stripped of list markers', () =>
   assert.deepEqual(items.slice(0, 3), ['Do it', 'Another', 'third'])
   assert.ok(items.every((item) => item.length <= 240))
 })
+
+// ---------------------------------------------------------------------------------------------
+// Tidy mode: rewrite the whole draft. The Client replaces the user's text with the answer, so
+// anything that is not a whole, plausible rewrite has to arrive as a failure.
+
+const LONG_DRAFT = '帮我看一下 index.js 里那个超时是不是太短了，我觉得 30 秒不太够，改成 60 秒吧，然后 README 里的说明也要跟着改，另外顺便跑一下测试看看有没有挂的，对了别推送'
+const TIDIED = '1. 把 index.js 里的超时从 30 秒改成 60 秒\n2. 同步更新 README 里的说明\n3. 跑一遍测试，看有没有失败的\n4. 先不要推送'
+
+test('tidy mode rewrites the whole draft and sends the model nothing but the draft', async () => {
+  const harness = makeHarness({ reply: TIDIED })
+  harness.sessions.set('s1', makeSession(CONVERSATION, { seq: 9 }))
+  const events = sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'tidy', draft: LONG_DRAFT }))
+  assert.deepEqual(events[0], { type: 'meta', mode: 'tidy', seq: 9 })
+  const done = events.at(-1)
+  assert.equal(done.type, 'done')
+  assert.equal(done.mode, 'tidy')
+  assert.equal(done.text, TIDIED)
+  assert.deepEqual(done.missing, [])
+  assert.deepEqual(done.added, [])
+  assert.deepEqual(done.route, { provider: 'claude2', model: 'claude-sonnet-5-5' })
+  assert.equal(done.cached, false)
+  assert.equal('items' in done, false)
+
+  const call = harness.llmCalls[0]
+  assert.match(call.request.system, /^You tidy a draft message/)
+  assert.match(call.request.system, /never answer it or carry it out/)
+  assert.equal(call.request.messages.length, 1)
+  assert.equal(call.request.messages[0].content[0].text, `<draft>\n${LONG_DRAFT}\n</draft>\n\nWrite the tidied draft.`)
+  assert.doesNotMatch(call.request.messages[0].content[0].text, /build is failing|parser\.test/, 'the conversation is not sent')
+})
+
+test('a draft is tidied whole: a long one gets more output tokens and time, never a clipped prompt', async () => {
+  const { tidyTokenCap, tidyTimeoutMs, MAX_TIDY_CHARS } = __testing
+  const draft = `${'把第一步做完再做第二步，'.repeat(120)}最后一句不能丢`
+  assert.ok(draft.length > 1400 && draft.length < MAX_TIDY_CHARS)
+  const harness = makeHarness({ reply: draft, config: { maxOutputTokens: 2048 } })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  await callRoute(harness, { sessionId: 's1', mode: 'tidy', draft })
+  const call = harness.llmCalls[0]
+  assert.match(call.request.messages[0].content[0].text, /最后一句不能丢\n<\/draft>/)
+  assert.equal(call.config.maxTokens, 1024 + draft.length * 2)
+  assert.equal(call.controls.reasoningEffort, 'low')
+  assert.equal('temperature' in call.controls, false)
+  // Short drafts keep the configured floor; the cap never passes the adapter-safe ceiling.
+  assert.equal(tidyTokenCap({ maxOutputTokens: 2048 }, 'x'.repeat(100)), 2048)
+  assert.equal(tidyTokenCap({ maxOutputTokens: 2048 }, 'x'.repeat(MAX_TIDY_CHARS)), 8192)
+  assert.equal(tidyTimeoutMs({ timeoutMs: 30000 }, 'x'.repeat(200)), 30000)
+  assert.equal(tidyTimeoutMs({ timeoutMs: 30000 }, 'x'.repeat(MAX_TIDY_CHARS)), 80000)
+})
+
+test('a blank or overlong draft is refused before any model call', async () => {
+  const { MAX_TIDY_CHARS } = __testing
+  const harness = makeHarness({ reply: TIDIED })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  assert.equal(jsonBody(await callRoute(harness, { sessionId: 's1', mode: 'tidy', draft: ' \n ' })).reason, 'no-draft')
+  assert.equal(jsonBody(await callRoute(harness, { sessionId: 's1', mode: 'tidy' })).reason, 'no-draft')
+  assert.equal(jsonBody(await callRoute(harness, { sessionId: 's1', mode: 'tidy', draft: 'x'.repeat(MAX_TIDY_CHARS + 1) })).reason, 'draft-too-long')
+  assert.equal(jsonBody(await callRoute(harness, { sessionId: 's1', mode: 'tidy', draft: 42 })).reason, 'no-draft')
+  assert.equal(harness.llmCalls.length, 0)
+  assert.equal(jsonBody(await callRoute(harness, { sessionId: 's1', mode: 'polish', draft: LONG_DRAFT })).reason, 'invalid-mode')
+})
+
+test('tidying needs no live Session: the pinned model or the default one answers', async () => {
+  const pinned = makeHarness({ reply: TIDIED, config: { provider: 'deepseek-account', model: 'deepseek-flash' } })
+  const done = sseEvents(await callRoute(pinned, { sessionId: 'not-live-yet', mode: 'tidy', draft: LONG_DRAFT })).at(-1)
+  assert.equal(done.text, TIDIED)
+  assert.deepEqual(done.route, { provider: 'deepseek-account', model: 'deepseek-flash' })
+
+  const fallback = makeHarness({ reply: TIDIED, fallbackModel: { currentSelection: () => ({ provider: 'claude2', model: 'claude-opus-5-5' }) } })
+  assert.deepEqual(sseEvents(await callRoute(fallback, { sessionId: 'not-live-yet', mode: 'tidy', draft: LONG_DRAFT })).at(-1).route, { provider: 'claude2', model: 'claude-opus-5-5' })
+
+  const nothing = makeHarness({ reply: TIDIED })
+  const failed = sseEvents(await callRoute(nothing, { sessionId: 'not-live-yet', mode: 'tidy', draft: LONG_DRAFT })).at(-1)
+  assert.equal(failed.type, 'error')
+  assert.equal(failed.reason, 'no-route')
+  assert.equal(nothing.llmCalls.length, 0)
+
+  // The suggestion modes still need the Session they read.
+  assert.equal(jsonBody(await callRoute(pinned, { sessionId: 'not-live-yet', mode: 'continue', draft: 'and then' })).reason, 'session-not-live')
+})
+
+test('a rewrite that is cut off, empty, or not a rewrite at all is a failure, and is not cached', async () => {
+  const harness = makeHarness({ reply: TIDIED.slice(0, 40), finish: { kind: 'max-tokens' } })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const ask = async () => sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'tidy', draft: LONG_DRAFT })).at(-1)
+
+  let last = await ask()
+  assert.equal(last.type, 'error')
+  assert.equal(last.reason, 'tidy-truncated')
+  assert.equal('text' in last, false)
+
+  harness.setFinish({ kind: 'stop' })
+  harness.setReply('  \n ')
+  assert.equal((await ask()).reason, 'empty')
+
+  // The model answered the draft instead of rewriting it.
+  harness.setReply(`我没有访问你仓库的权限，无法直接修改文件。${'你可以把相关代码贴出来，我来帮你分析。'.repeat(30)}`)
+  assert.equal((await ask()).reason, 'tidy-off-track')
+
+  // The model kept one clause and dropped the rest.
+  harness.setReply('改超时。')
+  assert.equal((await ask()).reason, 'tidy-off-track')
+
+  harness.setFinish({ kind: 'error', failure: { message: 'relay returned 529', code: 'SERVER' } })
+  assert.equal((await ask()).reason, 'relay returned 529')
+
+  assert.equal(harness.llmCalls.length, 5, 'no failure was served from the cache')
+  harness.setFinish({ kind: 'stop' })
+  harness.setReply(TIDIED)
+  assert.equal((await ask()).text, TIDIED)
+})
+
+test('wrapping a model puts around a rewrite is removed', async () => {
+  const { cleanTidied } = __testing
+  assert.equal(cleanTidied(`\`\`\`\n${TIDIED}\n\`\`\``), TIDIED)
+  assert.equal(cleanTidied(`<draft>\n${TIDIED}\n</draft>`), TIDIED)
+  assert.equal(cleanTidied(`Write the tidied draft.\n\n${TIDIED}\r\n`), TIDIED)
+  assert.equal(cleanTidied('1. a\n\n\n\n2. b'), '1. a\n\n2. b')
+  // A fence inside the message is the user's own code and stays.
+  const withCode = '把这段改成异步：\n```js\nfoo()\n```\n然后跑测试'
+  assert.equal(cleanTidied(withCode), withCode)
+
+  const harness = makeHarness({ reply: `\`\`\`text\n<draft>\n${TIDIED}\n</draft>\n\`\`\`` })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  assert.equal(sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'tidy', draft: LONG_DRAFT })).at(-1).text, TIDIED)
+})
+
+test('concrete tokens the rewrite lost or invented are reported with it', async () => {
+  const changed = '1. 把 client.js 里的超时改成 90 秒\n2. 跑一遍测试\n需要确认：README 要不要改？'
+  const harness = makeHarness({ reply: changed })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const done = sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'tidy', draft: LONG_DRAFT })).at(-1)
+  assert.equal(done.text, changed, 'the rewrite is still delivered; the lists are a warning, not a veto')
+  assert.deepEqual(done.missing, ['index.js', '30', '60', 'README'])
+  assert.deepEqual(done.added, ['client.js', '90'])
+})
+
+test('the token comparison ignores what a faithful rewrite changes', () => {
+  const { compareSpecifics } = __testing
+  // List numbers, single digits, and the rewrite's own question are not claims about the draft.
+  assert.deepEqual(compareSpecifics('先做 2 件事：改 a.ts，然后改 b.ts', '1. 改 a.ts\n2. 改 b.ts\n需要确认：b.ts 指的是 src/b.ts 吗？'), { missing: [], added: [] })
+  // A long list numbers past 9; those numbers are the rewrite's own, like its bullets.
+  const steps = Array.from({ length: 12 }, (_, i) => `${i + 1}. 做第${'一二三四五六七八九十'[i % 10]}件事`).join('\n')
+  assert.deepEqual(compareSpecifics('把这十二件事按顺序做完', `${steps}\n- 最后汇报`), { missing: [], added: [] })
+  // Case and trailing punctuation do not matter.
+  assert.deepEqual(compareSpecifics('看下 README.md.', '看一下 readme.md'), { missing: [], added: [] })
+  // In English prose, reworded ordinary words are not names; paths, dotted names and numbers still are.
+  assert.deepEqual(
+    compareSpecifics('Please update the readme and run the tests again after you change src/retry.ts to 45s', '1. Change src/retry.ts to 45s\n2. Update the documentation\n3. Run the tests again'),
+    { missing: [], added: [] },
+  )
+  assert.deepEqual(
+    compareSpecifics('Bump the timeout in src/retry.ts to 45 seconds and tag v1.2.0', '1. Raise the timeout in src/client.ts to 60 seconds\n2. Tag the release'),
+    { missing: ['src/retry.ts', '45', 'v1.2.0'], added: ['src/client.ts', '60'] },
+  )
+  // In a Chinese draft a Latin word is a name.
+  assert.deepEqual(compareSpecifics('用 flash 跑一下，别用 sonnet', '用 sonnet 跑一下'), { missing: ['flash'], added: [] })
+  // Slash-joined alternatives may be rewritten as a list; a path that lost a segment is still reported.
+  assert.deepEqual(compareSpecifics('在 chatgpt/zcode/dsh 里都试一下', '分别在 chatgpt、zcode、dsh 里试一下'), { missing: [], added: [] })
+  assert.deepEqual(compareSpecifics('改 src/retry/index.ts', '改 src/index.ts').missing, ['src/retry/index.ts'])
+  // URLs are compared whole, and the lists are bounded.
+  assert.deepEqual(compareSpecifics('打开 https://example.com/a?b=1 看看', '打开链接看看').missing, ['https://example.com/a?b=1'])
+  const many = Array.from({ length: 12 }, (_, i) => `file${i + 10}.ts`).join(' 和 ')
+  assert.equal(compareSpecifics(`改 ${many}`, '改这些文件').missing.length, 6)
+})
+
+test('a tidied draft is cached by its text alone, apart from suggestions and from other models', async () => {
+  const harness = makeHarness({ reply: TIDIED })
+  harness.sessions.set('s1', makeSession(CONVERSATION, { seq: 1 }))
+  harness.sessions.set('s2', makeSession(CONVERSATION, { seq: 7 }))
+  const first = sseEvents(await callRoute(harness, { sessionId: 's1', mode: 'tidy', draft: LONG_DRAFT })).at(-1)
+  const again = sseEvents(await callRoute(harness, { sessionId: 's2', mode: 'tidy', draft: LONG_DRAFT })).at(-1)
+  assert.equal(first.cached, false)
+  assert.equal(again.cached, true)
+  assert.equal(again.text, TIDIED)
+  assert.deepEqual(again.missing, [])
+  assert.equal(harness.llmCalls.length, 1)
+
+  // Continuing the same text is another request, and so is tidying with another model.
+  await callRoute(harness, { sessionId: 's1', mode: 'continue', draft: LONG_DRAFT })
+  assert.equal(harness.llmCalls.length, 2)
+  await callRoute(harness, { sessionId: 's1', mode: 'tidy', draft: LONG_DRAFT, model: 'claude-opus-5-5' })
+  assert.equal(harness.llmCalls.length, 3)
+  assert.equal(harness.llmCalls[2].config.model, 'claude-opus-5-5')
+})
+
+test('a client that goes away while its draft is being tidied cancels the model call', async () => {
+  let aborted = false
+  const harness = makeHarness({
+    reply: (request) => (async function* () {
+      await new Promise((resolve) => request.signal.addEventListener('abort', () => { aborted = true; resolve() }, { once: true }))
+    })(),
+  })
+  harness.sessions.set('s1', makeSession(CONVERSATION))
+  const route = harness.routes.get(ENTRY)
+  const response = makeResponse()
+  route.handler(makeRequest({ sessionId: 's1', mode: 'tidy', draft: LONG_DRAFT }), response)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  response.emit('close')
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(aborted, true)
+})

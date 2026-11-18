@@ -1,6 +1,7 @@
 # Composer suggestions: after a turn ends the Host streams follow-up messages;
 # when you press Tab at the end of a draft it streams continuations of that draft.
 # The Client renders ghost text and accepts it on Tab (Alt+Down cycles candidates).
+# The Tidy button (Alt+T) sends the draft alone and replaces it with a clearer rewrite.
 - insert:
     - id: composer-suggest
       name: dsh-composer-suggest
@@ -16,7 +17,9 @@
         # effort when "low" is not offered. No temperature is sent.
         reasoningEffort: low
         # Thinking counts toward this cap; three candidates alone need under 100 tokens.
+        # Tidying a long draft raises it for that call, to at most 8192.
         maxOutputTokens: 2048
+        # Tidying a long draft may take longer: 20 s plus 15 ms per character when that is more.
         timeoutMs: 30000
         maxSuggestions: 3
         # Prompt for both modes. A turn (what you typed plus the agent's final reply) counts

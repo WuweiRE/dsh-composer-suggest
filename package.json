@@ -1,7 +1,7 @@
 {
   "name": "dsh-composer-suggest",
-  "version": "0.2.0",
-  "description": "Composer suggestions for the DeepSeek Harness Web UI: next-message ghost text after a reply plus Tab-triggered draft continuation, answered by the Session's own model or a model you pin.",
+  "version": "0.3.0",
+  "description": "Composer suggestions for the DeepSeek Harness Web UI: next-message ghost text after a reply, Tab-triggered draft continuation, and a Tidy button that rewrites a long draft into clear points in place, answered by the Session's own model or a model you pin.",
   "author": "WuweiRE",
   "license": "MIT",
   "type": "module",

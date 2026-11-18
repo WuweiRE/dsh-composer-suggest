@@ -51,12 +51,22 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
   const windowListeners = new Map()
   // Refs, effects and callbacks live across renders like in React: an effect re-runs only when
   // its dependencies changed. State is re-seeded by every render() call.
-  const refs = []
+  // Each seat (overlay, tidy button, tidy line) is its own component instance with its own hooks.
+  const hookStores = new Map()
+  let refs = []
   let refIndex = 0
-  const effectSlots = []
+  let effectSlots = []
   let effectIndex = 0
-  const callbackSlots = []
+  let callbackSlots = []
   let callbackIndex = 0
+  const useHooksOf = (seat) => {
+    if (!hookStores.has(seat)) hookStores.set(seat, { refs: [], effectSlots: [], callbackSlots: [] })
+    ;({ refs, effectSlots, callbackSlots } = hookStores.get(seat))
+    refIndex = 0
+    effectIndex = 0
+    callbackIndex = 0
+  }
+  useHooksOf('conversation.input.overlay')
   const depsChanged = (previous, next) =>
     previous === undefined || next === undefined || previous.length !== next.length || next.some((value, i) => !Object.is(value, previous[i]))
   const scheduleEffect = (list, fn, deps) => {
@@ -82,7 +92,7 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
   const scroll = { style: { marginBottom: '' }, getBoundingClientRect: () => ({ bottom: view.scrollBottom }) }
   const editor = { closest: (selector) => (selector === '[data-input-scroll]' && view.hasScroll ? scroll : null), contains: (node) => (node === document.activeElement ? view.focusInEditor : true), getBoundingClientRect: () => ({ left: 0, top: 0, right: view.width - 4, width: view.width, height: 100 }) }
   const card = {
-    contains: () => true,
+    contains: () => view.focusInCard !== false,
     querySelector: () => editor,
     // The Host's attachment rail renders one <img> per pasted picture.
     querySelectorAll: (selector) => (selector === 'img' ? view.images : []),
@@ -227,14 +237,39 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
     insertText: (value) => { inserted.push(value); return view.insert },
     setDraft: () => { throw new Error('Must never replace the draft') },
   }
+  // Only tidying may replace the draft; its seats get actions that record the replacement.
+  const replaced = []
+  const tidyActions = {
+    ...inputActions,
+    setDraft: (value) => {
+      if (view.refuseReplace === true) throw new Error('editor is locked')
+      replaced.push(value)
+      view.draft = value
+    },
+  }
+
+  /** Render one of the tidy seats against the composer's current input state. */
+  function renderSeat(name, { draft = view.draft, occurrences = [], phase = 'plain', sessionId = 's1' } = {}) {
+    view.draft = draft
+    useHooksOf(name)
+    effects.length = 0
+    layouts.length = 0
+    timers.length = 0
+    const wrapper = registered[name].component({
+      sessionId,
+      useInput: (select) => select({ draft, attachmentIds: view.attachmentIds, occurrences, phase }),
+      useSessionStatus: (select) => select(new Map([['s1', { running: false }]])),
+      inputActions: tidyActions,
+    })
+    const tree = wrapper.type(wrapper.props)
+    return { tree, effects: effects.slice(), listeners, timers: timers.slice() }
+  }
 
   function render({ draft = '', ghost, box, running = false, reserve = 0, attachments } = {}) {
     view.draft = draft
     if (attachments !== undefined) view.attachmentIds = attachments
     index = 0
-    refIndex = 0
-    effectIndex = 0
-    callbackIndex = 0
+    useHooksOf('conversation.input.overlay')
     effects.length = 0
     layouts.length = 0
     timers.length = 0
@@ -255,7 +290,7 @@ function load({ prefs, fetch, storageBlocked = false } = {}) {
     return { tree, state, effects, layouts, listeners, request, timers }
   }
 
-  return { module, registered, render, view, scroll, inserted, fetchCalls, imageFetches, warnings, windowListeners, localStorage, dictionaries, effects, layouts, listeners, timers }
+  return { module, registered, render, renderSeat, tidyActions, replaced, view, scroll, inserted, fetchCalls, imageFetches, warnings, windowListeners, localStorage, dictionaries, effects, layouts, listeners, timers }
 }
 
 function keyEvent(key, extra = {}) {
@@ -286,27 +321,30 @@ test('registers the overlay and the General settings row, and loads no Harness c
   assert.equal(typeof app.dictionaries.value.zh.next, 'string')
 })
 
-test('both modes are on by default and toggle independently', () => {
+test('every feature is on by default and toggles independently', () => {
   const app = load()
   const { readPrefs, setPref } = app.module.__testing
-  same(readPrefs(), { next: true, continue: true, model: '' })
+  same(readPrefs(), { next: true, continue: true, tidy: true, model: '' })
   setPref('continue', false)
-  same(readPrefs(), { next: true, continue: false, model: '' })
-  same(JSON.parse(app.localStorage.saved), { next: true, continue: false, model: '' })
+  same(readPrefs(), { next: true, continue: false, tidy: true, model: '' })
+  same(JSON.parse(app.localStorage.saved), { next: true, continue: false, tidy: true, model: '' })
   setPref('next', false)
-  same(readPrefs(), { next: false, continue: false, model: '' })
+  same(readPrefs(), { next: false, continue: false, tidy: true, model: '' })
+  setPref('tidy', false)
+  same(readPrefs(), { next: false, continue: false, tidy: false, model: '' })
 })
 
 test('saved preferences are restored, and blocked storage still works for the window', () => {
   const restored = load({ prefs: { next: false, continue: true, model: ' claude-sonnet-5-5 ' } })
-  same(restored.module.__testing.readPrefs(), { next: false, continue: true, model: 'claude-sonnet-5-5' })
+  same(restored.module.__testing.readPrefs(), { next: false, continue: true, tidy: true, model: 'claude-sonnet-5-5' })
 
-  // Older saved preferences have no model: the Session's model answers.
+  // Older saved preferences have no model and no tidy switch: the Session's model answers, and tidy is on.
   const older = load({ prefs: { next: true, continue: false } })
-  same(older.module.__testing.readPrefs(), { next: true, continue: false, model: '' })
+  same(older.module.__testing.readPrefs(), { next: true, continue: false, tidy: true, model: '' })
+  same(load({ prefs: { next: true, continue: true, tidy: false, model: '' } }).module.__testing.readPrefs(), { next: true, continue: true, tidy: false, model: '' })
 
   const blocked = load({ storageBlocked: true })
-  same(blocked.module.__testing.readPrefs(), { next: true, continue: true, model: '' })
+  same(blocked.module.__testing.readPrefs(), { next: true, continue: true, tidy: true, model: '' })
   assert.doesNotThrow(() => blocked.module.__testing.setPref('next', false))
   assert.equal(blocked.module.__testing.readPrefs().next, false)
 })
@@ -315,22 +353,25 @@ test('another window changing the preference is picked up through the storage ev
   const app = load()
   const onStorage = app.windowListeners.get('storage')
   onStorage({ key: 'something-else', newValue: '{"next":false}' })
-  same(app.module.__testing.readPrefs(), { next: true, continue: true, model: '' })
+  same(app.module.__testing.readPrefs(), { next: true, continue: true, tidy: true, model: '' })
   onStorage({ key: PREFERENCE_KEY, newValue: JSON.stringify({ next: false, continue: true, model: 'claude-sonnet-5-5' }) })
-  same(app.module.__testing.readPrefs(), { next: false, continue: true, model: 'claude-sonnet-5-5' })
+  same(app.module.__testing.readPrefs(), { next: false, continue: true, tidy: true, model: 'claude-sonnet-5-5' })
   onStorage({ key: PREFERENCE_KEY, newValue: null })
-  same(app.module.__testing.readPrefs(), { next: true, continue: true, model: '' })
+  same(app.module.__testing.readPrefs(), { next: true, continue: true, tidy: true, model: '' })
 })
 
-test('the settings row has one switch per mode, a model field, a cost note, and a status line', () => {
+test('the settings row has one switch per feature, a model field, a cost note, and a status line', () => {
   const app = load()
   const element = app.registered['settings.general.item'].component()
   const row = element.type(element.props)
   const toggles = row.children.filter((child) => child && child.props && 'checked' in child.props)
-  same(toggles.map((toggle) => toggle.props.title), ['Suggest my next message', 'Continue my draft with Tab'])
+  same(toggles.map((toggle) => toggle.props.title), ['Suggest my next message', 'Continue my draft with Tab', 'Tidy my draft'])
   assert.ok(toggles.every((toggle) => toggle.props.checked === true))
+  assert.match(toggles[2].props.hint, /Alt\+T does the same/, 'the hint names the shortcut')
   toggles[1].props.onChange(false)
-  same(app.module.__testing.readPrefs(), { next: true, continue: false, model: '' })
+  same(app.module.__testing.readPrefs(), { next: true, continue: false, tidy: true, model: '' })
+  toggles[2].props.onChange(false)
+  same(app.module.__testing.readPrefs(), { next: true, continue: false, tidy: false, model: '' })
   const status = row.children.find((child) => child && child.type && child.type.name === 'StatusLine')
   assert.ok(status, 'the row ends with the status line')
   const field = row.children.find((child) => child && child.type && child.type.name === 'ModelField')
@@ -351,7 +392,7 @@ test('a model typed in Settings is saved when the box loses focus, trimmed, and 
   assert.equal(modelInput(app).props.defaultValue, '')
   modelInput(app).props.onBlur({ target: { value: '  claude-sonnet-5-5 ' } })
   assert.equal(app.module.__testing.readPrefs().model, 'claude-sonnet-5-5')
-  same(JSON.parse(app.localStorage.saved), { next: true, continue: true, model: 'claude-sonnet-5-5' })
+  same(JSON.parse(app.localStorage.saved), { next: true, continue: true, tidy: true, model: 'claude-sonnet-5-5' })
   // The box shows the saved value and is reloaded when it changes elsewhere.
   assert.equal(modelInput(app).props.defaultValue, 'claude-sonnet-5-5')
   assert.equal(modelInput(app).props.key, 'claude-sonnet-5-5')
@@ -1222,4 +1263,613 @@ test('stream consumption requires a terminal event and handles split UTF-8 frame
     controller.close()
   } })
   assert.equal(await consumeStream(incomplete, new AbortController().signal, () => {}), false)
+})
+
+// ---------------------------------------------------------------------------------------------
+// Tidy: the toolbar button and its shortcut rewrite the whole draft in place. The status (what
+// happened, what to check, Restore) is shown under the composer, or in the toolbar seat itself
+// where no line is mounted, as in a new Session's composer.
+
+const RIGHT = 'conversation.input.right'
+const DOCK = 'conversation.composer.dock'
+const LONG = '帮我看一下 index.js 里那个超时是不是太短了，我觉得 30 秒不太够，改成 60 秒吧，然后 README 里的说明也要跟着改'
+const NEAT = '1. 把 index.js 里的超时从 30 秒改成 60 秒\n2. 同步更新 README 里的说明'
+const EDITED = `${NEAT}\n3. 先不要推送，等我确认之后再说，另外把这次改动写进 CHANGELOG 里`
+const ROUTE = { provider: 'deepseek-account', model: 'deepseek-flash' }
+const DONE_TEXT = 'Tidied. Check it before sending.'
+const tidyDone = (extra = {}) => sse({ type: 'meta', mode: 'tidy', seq: 3 }, { type: 'done', mode: 'tidy', text: NEAT, missing: [], added: [], cached: false, route: ROUTE, ms: 1800, ...extra })
+const altT = (extra = {}) => keyEvent('†', { code: 'KeyT', altKey: true, ...extra })
+
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+/** All text a rendered tree would show, in order. */
+function textOf(node) {
+  if (node === null || node === undefined || node === false) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (node.type === 'style') return ''
+  return (node.children ?? []).map(textOf).join(' ').replace(/\s+/g, ' ').trim()
+}
+const findAll = (node, test, out = []) => {
+  if (node === null || typeof node !== 'object') return out
+  if (test(node)) out.push(node)
+  for (const child of node.children ?? []) findAll(child, test, out)
+  return out
+}
+const byClass = (node, name) => findAll(node, (item) => typeof item.props?.className === 'string' && item.props.className.split(' ').includes(name))
+
+/**
+ * `button()` and `line()` render one seat and run its effects. Rendering `line()` mounts the
+ * line, as in an ongoing conversation; a test that never does stands for a new Session.
+ */
+function tidyApp(options = {}) {
+  const app = load({ prefs: options.prefs, fetch: options.fetch ?? (async () => streamResponse(tidyDone())) })
+  const seat = (name) => (input) => {
+    const rendered = app.renderSeat(name, input)
+    for (const effect of rendered.effects) effect()
+    return rendered.tree
+  }
+  const button = seat(RIGHT)
+  const line = seat(DOCK)
+  /** The main Tidy / Restore button of the toolbar seat. */
+  const press = (tree) => byClass(tree, 'cs-tidy')[0]
+  /** The status the toolbar seat shows itself when no line is mounted. */
+  const inline = (tree) => byClass(tree, 'cs-tidy-inline')[0]
+  const tidy = app.module.__testing.tidy
+  /** Let the double-click guard pass. */
+  const age = () => { tidy.read('s1').startedAt -= tidy.clickGuardMs + 1 }
+  return { app, button, line, press, inline, tidy, age }
+}
+
+test('tidy registers a toolbar button and a line under the composer, beside the suggestion overlay', () => {
+  const { app } = tidyApp()
+  assert.equal(app.registered[RIGHT].spec.id, 'composer-suggest-tidy')
+  assert.equal(app.registered[DOCK].spec.id, 'composer-suggest-tidy')
+  assert.equal(app.registered['conversation.input.overlay'].spec.id, 'composer-suggest')
+  same(Object.keys(app.dictionaries.value.en).sort(), Object.keys(app.dictionaries.value.zh).sort())
+  for (const [key, value] of Object.entries(app.dictionaries.value.zh)) assert.ok(typeof value === 'string' && value !== '', key)
+})
+
+test('the tidy button appears once the draft is long enough to reorganize', () => {
+  const { button, press } = tidyApp()
+  assert.equal(press(button({ draft: '' })), undefined)
+  assert.equal(press(button({ draft: '把超时改成 60 秒' })), undefined, 'a short draft gets no button')
+  const shown = press(button({ draft: LONG }))
+  assert.equal(shown.props['data-composer-tidy'], 'tidy')
+  assert.equal(textOf(shown), 'Tidy')
+  assert.equal(shown.props.title, 'Tidy this draft into clear points (Alt+T)')
+  assert.equal(shown.props['aria-label'], 'Tidy. Tidy this draft into clear points (Alt+T)', 'the accessible name starts with the visible word')
+
+  // The click must not take the caret out of the editor.
+  let prevented = false
+  shown.props.onMouseDown({ preventDefault: () => { prevented = true } })
+  assert.equal(prevented, true)
+})
+
+test('a draft with @ references keeps the button, and pressing it explains why nothing happens', async () => {
+  const { app, button, line, press } = tidyApp()
+  line()
+  const shown = press(button({ draft: LONG, occurrences: [{ offset: 3 }] }))
+  assert.equal(textOf(shown), 'Tidy')
+  shown.props.onClick()
+  await tick()
+  assert.equal(textOf(line()), 'Tidying would drop the @ references in this draft, so it was left as it is.')
+  assert.equal(app.fetchCalls.length, 0)
+  assert.equal(app.replaced.length, 0)
+})
+
+test('clicking Tidy sends the whole draft, replaces it with the rewrite, and offers Restore', async () => {
+  const { app, button, line, press, tidy } = tidyApp()
+  line()
+  press(button({ draft: LONG })).props.onClick()
+  assert.equal(tidy.read('s1').phase, 'working')
+  await tick()
+
+  assert.equal(app.fetchCalls.length, 1)
+  assert.equal(app.fetchCalls[0].url, ENDPOINT)
+  same(JSON.parse(app.fetchCalls[0].init.body), { sessionId: 's1', mode: 'tidy', draft: LONG })
+  same(app.replaced, [NEAT])
+  assert.equal(app.inserted.length, 0, 'tidy never goes through text insertion')
+  same(app.module.__testing.readStatus(), { state: 'ok', route: 'deepseek-account / deepseek-flash', ms: 1800 })
+
+  const state = tidy.read('s1')
+  assert.equal(state.phase, 'done')
+  assert.equal(state.original, LONG)
+  assert.equal(state.tidied, NEAT)
+
+  // The button now undoes, and the line says to read the result.
+  const undo = press(button())
+  assert.equal(undo.props['data-composer-tidy'], 'restore')
+  assert.equal(textOf(undo), 'Restore')
+  assert.equal(undo.props['aria-label'], 'Restore. Restore the draft from before tidying (Alt+T)')
+  const row = line()
+  assert.equal(row.props.role, 'status')
+  assert.equal(row.props['data-composer-tidy-status'], 'done')
+  assert.equal(textOf(row), `${DONE_TEXT} Restore ×`)
+
+  undo.props.onClick()
+  same(app.replaced, [NEAT, LONG])
+  assert.equal(tidy.read('s1').phase, 'idle')
+  assert.equal(line(), null)
+  assert.equal(textOf(press(button())), 'Tidy')
+})
+
+test('tokens the Host could not match are named next to the result, and Restore in the line works too', async () => {
+  const { app, button, line, press, tidy } = tidyApp({
+    fetch: async () => streamResponse(tidyDone({ missing: ['README', '30'], added: ['client.js'] })),
+  })
+  line()
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  const row = line()
+  assert.equal(textOf(row), `${DONE_TEXT} May be missing: README、30 Added, not in your original: client.js Restore ×`)
+  assert.equal(byClass(row, 'cs-tidy-status__warn').length, 2)
+
+  const [restore, close] = findAll(row, (node) => node.type === 'button')
+  assert.equal(textOf(restore), 'Restore')
+  assert.equal(restore.props.title, 'Restore the draft from before tidying', 'no shortcut is promised here: after edits the key tidies again')
+  assert.equal(close.props['aria-label'], 'Dismiss')
+  restore.props.onClick()
+  same(app.replaced, [NEAT, LONG])
+  assert.equal(tidy.read('s1').phase, 'idle')
+})
+
+test('dismissing the line keeps the tidied draft and forgets the original', async () => {
+  const { app, button, line, press, tidy } = tidyApp()
+  line()
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  findAll(line(), (node) => node.type === 'button')[1].props.onClick()
+  assert.equal(tidy.read('s1').phase, 'idle')
+  same(app.replaced, [NEAT])
+  assert.equal(line(), null)
+  // What is left is an ordinary draft again: long enough, so the button offers to tidy it.
+  assert.ok(NEAT.length >= 40)
+  assert.equal(textOf(press(button())), 'Tidy')
+})
+
+test('a draft that cannot or need not be tidied says why and asks the model nothing', async () => {
+  const { app, line, tidy } = tidyApp()
+  const run = (input) => tidy.run('s1', { phase: 'plain', chips: 0, readDraft: () => input.draft, ...input }, app.tidyActions)
+
+  await run({ draft: '把超时改成 60 秒' })
+  assert.equal(textOf(line()), 'This draft is short enough already.')
+  await run({ draft: LONG, chips: 1 })
+  assert.equal(textOf(line()), 'Tidying would drop the @ references in this draft, so it was left as it is.')
+  await run({ draft: 'x'.repeat(4001) })
+  assert.equal(textOf(line()), 'This draft is too long to tidy (over 4000 characters).')
+  assert.equal(line().props['data-composer-tidy-status'], 'notice')
+
+  // Nothing typed, or a message on its way out: no notice either.
+  tidy.dismiss('s1')
+  await run({ draft: '   ' })
+  await run({ draft: LONG, phase: 'sending' })
+  assert.equal(tidy.read('s1').phase, 'idle')
+  assert.equal(line(), null)
+
+  assert.equal(app.fetchCalls.length, 0)
+  assert.equal(app.replaced.length, 0)
+})
+
+test('a notice clears itself, a failure a little later, and only the notice the timer was set for', async () => {
+  const { app, button, tidy } = tidyApp()
+  await tidy.run('s1', { draft: '太短了', chips: 0, phase: 'plain', readDraft: () => '太短了' }, app.tidyActions)
+  button({ draft: '太短了' })
+  assert.equal(app.timers.length, 1)
+  assert.equal(app.timers[0].ms, 6000)
+  const expire = app.timers[0].fn
+
+  // A newer notice arrives before the timer fires: the old timer must not remove it.
+  await tidy.run('s1', { draft: LONG, chips: 2, phase: 'plain', readDraft: () => LONG }, app.tidyActions)
+  expire()
+  assert.equal(tidy.read('s1').notice.key, 'tidyChips')
+  button({ draft: LONG })
+  app.timers.at(-1).fn()
+  assert.equal(tidy.read('s1').phase, 'idle')
+  assert.equal(tidy.read('s1').notice, undefined)
+
+  const failing = tidyApp({ fetch: async () => new Response('nope', { status: 500 }) })
+  failing.press(failing.button({ draft: LONG })).props.onClick()
+  await tick()
+  failing.button()
+  assert.equal(failing.app.timers.at(-1).ms, 12000)
+})
+
+test('typing while the draft is being tidied keeps what was typed', async () => {
+  const gate = deferred()
+  const { app, button, line, press, tidy } = tidyApp({ fetch: () => gate.promise })
+  line()
+  press(button({ draft: LONG })).props.onClick()
+  assert.equal(tidy.read('s1').phase, 'working')
+  // The user keeps typing; the button re-renders with the newer draft.
+  button({ draft: `${LONG}，还有别推送` })
+  gate.resolve(streamResponse(tidyDone()))
+  await tick()
+  assert.equal(app.replaced.length, 0)
+  assert.equal(textOf(line()), 'The draft changed while it was being tidied, so it was left as it is.')
+  assert.equal(tidy.read('s1').phase, 'idle')
+})
+
+test('a rewrite identical to the draft changes nothing', async () => {
+  const { app, button, line, press } = tidyApp({ fetch: async () => streamResponse(tidyDone({ text: `${LONG}\r\n` })) })
+  line()
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  assert.equal(app.replaced.length, 0)
+  assert.equal(textOf(line()), 'Nothing to tidy: the draft is already clear.')
+})
+
+test('while tidying, the button and the line show it; a double click does not cancel, a later click does', async () => {
+  const gate = deferred()
+  const { app, button, line, press, tidy, age } = tidyApp({ fetch: () => gate.promise })
+  line()
+  const start = press(button({ draft: LONG }))
+  start.props.onClick()
+  // The second half of a double click lands on the same button.
+  start.props.onClick()
+  assert.equal(tidy.read('s1').phase, 'working', 'a rewrite is not started and cancelled in one gesture')
+
+  const busy = press(button())
+  assert.equal(busy.props['data-composer-tidy'], 'working')
+  assert.equal(busy.props['aria-busy'], 'true')
+  assert.equal(textOf(busy), 'Tidying…')
+  assert.match(busy.props.title, /Click or press Esc to cancel/)
+  assert.equal(byClass(busy, 'cs-spin').length, 1)
+  const row = line()
+  assert.equal(textOf(row), 'Tidying… Esc to cancel')
+  assert.equal(byClass(row, 'cs-spin').length, 0, 'one spinner is enough')
+
+  // Asking again while working is not a second request.
+  await tidy.run('s1', { draft: LONG, chips: 0, phase: 'plain', readDraft: () => LONG }, app.tidyActions)
+  assert.equal(app.fetchCalls.length, 1)
+
+  age()
+  busy.props.onClick()
+  assert.equal(app.fetchCalls[0].init.signal.aborted, true)
+  assert.equal(tidy.read('s1').phase, 'idle')
+  gate.resolve(streamResponse(tidyDone()))
+  await tick()
+  assert.equal(app.replaced.length, 0, 'an answer that arrives after cancelling is dropped')
+  assert.equal(line(), null, 'cancelling is silent')
+  assert.equal(textOf(press(button())), 'Tidy')
+})
+
+test('cancelling after the answer arrived but before the stream closed still replaces nothing', async () => {
+  const closing = deferred()
+  const body = new ReadableStream({
+    async start(controller) {
+      controller.enqueue(new TextEncoder().encode(tidyDone()))
+      await closing.promise
+      controller.close()
+    },
+  })
+  const { app, button, press, tidy } = tidyApp({ fetch: async () => new Response(body, { headers: { 'content-type': 'text/event-stream' } }) })
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  assert.equal(tidy.read('s1').phase, 'working', 'the stream is still open')
+  tidy.cancel('s1')
+  closing.resolve()
+  await tick()
+  assert.equal(app.replaced.length, 0)
+  assert.equal(tidy.read('s1').phase, 'idle')
+})
+
+test('cancelling a second tidy of an edited result keeps the first Restore offer', async () => {
+  const gate = deferred()
+  let calls = 0
+  const { app, button, line, press, tidy, age } = tidyApp({ fetch: () => (++calls === 1 ? Promise.resolve(streamResponse(tidyDone())) : gate.promise) })
+  line()
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  press(button({ draft: EDITED })).props.onClick()
+  assert.equal(tidy.read('s1').phase, 'working')
+  age()
+  press(button()).props.onClick()
+  assert.equal(app.fetchCalls[1].init.signal.aborted, true)
+
+  const back = tidy.read('s1')
+  assert.equal(back.phase, 'done')
+  assert.equal(back.original, LONG, 'the first original can still be restored')
+  findAll(line(), (node) => node.type === 'button')[0].props.onClick()
+  same(app.replaced, [NEAT, LONG])
+})
+
+test('failures say what went wrong in plain words, keep the code for Settings, and leave the draft alone', async () => {
+  const unchanged = 'Your draft was not changed.'
+  const cases = [
+    [async () => streamResponse(sse({ type: 'meta', mode: 'tidy', seq: 1 }, { type: 'error', reason: 'tidy-truncated' })), 'the result was cut off', 'tidy-truncated'],
+    [async () => streamResponse(sse({ type: 'meta', mode: 'tidy', seq: 1 }, { type: 'error', reason: 'tidy-off-track' })), 'the model did not return a rewrite', 'tidy-off-track'],
+    [async () => streamResponse(sse({ type: 'meta', mode: 'tidy', seq: 1 }, { type: 'error', reason: 'no-route' })), 'no model is available for it', 'no-route'],
+    [async () => streamResponse(sse({ type: 'meta', mode: 'tidy', seq: 1 })), 'the connection was lost', 'stream-ended'],
+    [async () => streamResponse(tidyDone({ text: '  ' })), 'the model returned nothing', 'empty'],
+    [async () => { throw new Error('offline') }, 'the connection was lost', 'network'],
+    // A reason with no translation is shown as the Host gave it.
+    [async () => new Response('nope', { status: 500 }), 'HTTP 500', 'HTTP 500'],
+    [async () => streamResponse(sse({ type: 'meta', mode: 'tidy', seq: 1 }, { type: 'error', reason: 'relay returned 529' })), 'relay returned 529', 'relay returned 529'],
+  ]
+  for (const [fetch, why, reason] of cases) {
+    const { app, button, line, press, tidy } = tidyApp({ fetch })
+    line()
+    press(button({ draft: LONG })).props.onClick()
+    await tick()
+    const row = line()
+    assert.equal(textOf(row), `Tidying failed: ${why}. ${unchanged}`)
+    assert.equal(byClass(row, 'cs-tidy-status__error').length, 1)
+    same(app.module.__testing.readStatus(), { state: 'error', reason })
+    assert.equal(app.replaced.length, 0)
+    assert.equal(tidy.read('s1').phase, 'idle')
+  }
+
+  // The Host's own length refusal reads like the Client's.
+  const tooLong = tidyApp({ fetch: async () => new Response(JSON.stringify({ items: [], reason: 'draft-too-long' }), { headers: { 'content-type': 'application/json' } }) })
+  tooLong.line()
+  tooLong.press(tooLong.button({ draft: LONG })).props.onClick()
+  await tick()
+  assert.equal(textOf(tooLong.line()), 'This draft is too long to tidy (over 4000 characters).')
+
+  // The Chinese notice translates the reason as well.
+  const { app } = tidyApp()
+  const zh = app.dictionaries.value.zh
+  assert.equal(zh.tidyFailed.replace('{reason}', zh.tidyWhyTruncated), '整理失败：结果被截断。草稿未改动。')
+})
+
+test('an editor that refuses the replacement keeps the draft and says so', async () => {
+  const { app, button, line, press, tidy } = tidyApp()
+  line()
+  app.view.refuseReplace = true
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  assert.equal(app.replaced.length, 0)
+  assert.equal(textOf(line()), 'Tidying failed: the composer cannot be edited right now. Your draft was not changed.')
+
+  // The same holds for Restore: the original is kept until it is really back.
+  app.view.refuseReplace = false
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  app.view.refuseReplace = true
+  assert.equal(tidy.restore('s1', app.tidyActions), false)
+  assert.equal(tidy.read('s1').phase, 'done')
+  assert.equal(tidy.read('s1').original, LONG)
+})
+
+test('Alt+T tidies from the keyboard, and pressed again on the untouched result it restores', async () => {
+  const { app, button, tidy } = tidyApp()
+  button({ draft: LONG })
+
+  const first = altT()
+  app.listeners.get('keydown')(first)
+  assert.equal(first.prevented, true)
+  await tick()
+  same(app.replaced, [NEAT])
+
+  button()
+  const second = altT()
+  app.listeners.get('keydown')(second)
+  assert.equal(second.prevented, true)
+  same(app.replaced, [NEAT, LONG], 'the untouched result is undone')
+  assert.equal(tidy.read('s1').phase, 'idle')
+
+  // After editing the tidied text, the key tidies the edited text instead of throwing the edits away.
+  button()
+  app.listeners.get('keydown')(altT())
+  await tick()
+  button({ draft: EDITED })
+  app.listeners.get('keydown')(altT())
+  await tick()
+  assert.equal(app.fetchCalls.length, 3)
+  assert.equal(JSON.parse(app.fetchCalls[2].init.body).draft, EDITED)
+})
+
+test('the shortcut is Alt+T only, inside this composer only, and leaves the key alone when there is nothing to do', async () => {
+  const { app, button, tidy } = tidyApp()
+  button({ draft: LONG })
+  const fire = (event) => { app.listeners.get('keydown')(event); return event }
+
+  for (const event of [
+    keyEvent('t', { code: 'KeyT' }),
+    altT({ ctrlKey: true }),
+    altT({ metaKey: true }),
+    altT({ shiftKey: true }),
+    keyEvent('y', { code: 'KeyY', altKey: true }),
+    altT({ isComposing: true }),
+    altT({ defaultPrevented: true }),
+  ]) {
+    const before = event.defaultPrevented
+    fire(event)
+    assert.equal(event.prevented, false)
+    assert.equal(event.defaultPrevented, before)
+  }
+  app.view.focusInCard = false
+  assert.equal(fire(altT()).prevented, false, 'focus is elsewhere')
+  app.view.focusInCard = true
+  assert.equal(app.fetchCalls.length, 0)
+
+  // An empty composer has nothing to tidy: the key is not swallowed.
+  button({ draft: '' })
+  assert.equal(fire(altT()).prevented, false)
+  // A short draft swallows the key and says why.
+  button({ draft: '把超时改成 60 秒' })
+  assert.equal(fire(altT()).prevented, true)
+  assert.equal(tidy.read('s1').notice.key, 'tidyShort')
+  assert.equal(app.fetchCalls.length, 0)
+})
+
+test('Escape cancels a rewrite in flight at once and is otherwise left to the composer', async () => {
+  const gate = deferred()
+  const { app, button, tidy } = tidyApp({ fetch: () => gate.promise })
+  button({ draft: LONG })
+  const idle = keyEvent('Escape')
+  app.listeners.get('keydown')(idle)
+  assert.equal(idle.prevented, false)
+
+  app.listeners.get('keydown')(altT())
+  assert.equal(tidy.read('s1').phase, 'working')
+  // Alt+T again while working neither restarts nor leaks the key.
+  const again = altT()
+  app.listeners.get('keydown')(again)
+  assert.equal(again.prevented, true)
+  assert.equal(app.fetchCalls.length, 1)
+
+  // Escape is deliberate, so the double-click guard does not apply to it.
+  const escape = keyEvent('Escape')
+  app.listeners.get('keydown')(escape)
+  assert.equal(escape.prevented, true)
+  assert.equal(tidy.read('s1').phase, 'idle')
+  assert.equal(app.fetchCalls[0].init.signal.aborted, true)
+})
+
+test('editing the tidied draft keeps the Restore offer, and sending the message ends it', async () => {
+  const { button, line, press, tidy } = tidyApp()
+  line()
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  assert.equal(tidy.read('s1').phase, 'done')
+  // Edited: the button tidies again, the line still restores the original.
+  assert.equal(textOf(press(button({ draft: EDITED }))), 'Tidy')
+  assert.equal(tidy.read('s1').phase, 'done')
+  assert.match(textOf(line()), /Restore/)
+
+  // The message is on its way out.
+  button({ draft: EDITED, phase: 'sending' })
+  assert.equal(tidy.read('s1').phase, 'idle')
+  assert.equal(line(), null)
+})
+
+test('a composer emptied after tidying, as one Undo can do, still restores the original', async () => {
+  const { app, button, line, press, tidy } = tidyApp()
+  line()
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+
+  button({ draft: '' })
+  assert.equal(tidy.read('s1').phase, 'done')
+  assert.equal(tidy.read('s1').emptied, true)
+  const offer = press(button({ draft: '' }))
+  assert.equal(textOf(offer), 'Restore', 'the button stays, though the composer is empty')
+  assert.equal(textOf(line()), 'The draft is empty. Your text from before tidying is still kept. Restore ×')
+
+  // Alt+T restores here too, although an empty composer otherwise ignores the key.
+  const key = altT()
+  app.listeners.get('keydown')(key)
+  assert.equal(key.prevented, true)
+  same(app.replaced, [NEAT, LONG])
+  assert.equal(tidy.read('s1').phase, 'idle')
+})
+
+test('after emptying, Redo back to the tidied text keeps the offer and a different draft ends it', async () => {
+  const { button, line, press, tidy } = tidyApp()
+  line()
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  button({ draft: '' })
+  assert.equal(tidy.read('s1').emptied, true)
+  button({ draft: NEAT })
+  assert.equal(tidy.read('s1').phase, 'done')
+  assert.equal(tidy.read('s1').emptied, undefined)
+  assert.equal(textOf(line()), `${DONE_TEXT} Restore ×`)
+
+  button({ draft: '' })
+  button({ draft: '换个话题，帮我查一下昨天的构建为什么失败了' })
+  assert.equal(tidy.read('s1').phase, 'idle', 'the original belonged to another message')
+  assert.equal(line(), null)
+})
+
+test('where no line is mounted, as in a new Session, the toolbar seat shows the status itself', async () => {
+  const { app, button, press, inline, tidy } = tidyApp({ fetch: async () => streamResponse(tidyDone({ missing: ['README'] })) })
+  // Working: the button says it, so nothing more is shown.
+  press(button({ draft: LONG })).props.onClick()
+  assert.equal(inline(button()), undefined)
+  await tick()
+
+  const done = button()
+  const status = inline(done)
+  assert.equal(status.props.role, 'status')
+  assert.equal(status.props['data-composer-tidy-status'], 'done')
+  assert.equal(textOf(status), `${DONE_TEXT} May be missing: README Restore ×`)
+  assert.equal(textOf(press(done)), 'Restore')
+
+  // After an edit the main button tidies again, and the original is still one click away.
+  const edited = button({ draft: EDITED })
+  assert.equal(textOf(press(edited)), 'Tidy')
+  findAll(inline(edited), (node) => node.type === 'button')[0].props.onClick()
+  same(app.replaced, [NEAT, LONG])
+  assert.equal(tidy.read('s1').phase, 'idle')
+  assert.equal(inline(button()), undefined)
+})
+
+test('a notice in a new Session is shown in the toolbar seat, even when the draft is too short for the button', async () => {
+  const { app, button, press, inline, tidy } = tidyApp({ fetch: async () => streamResponse(sse({ type: 'meta', mode: 'tidy', seq: 1 }, { type: 'error', reason: 'tidy-truncated' })) })
+  button({ draft: '把超时改成 60 秒' })
+  app.listeners.get('keydown')(altT())
+  const short = button()
+  assert.equal(press(short), undefined)
+  assert.equal(textOf(inline(short)), 'This draft is short enough already.')
+
+  tidy.dismiss('s1')
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  const failed = inline(button())
+  const text = 'Tidying failed: the result was cut off. Your draft was not changed.'
+  assert.equal(textOf(failed), text)
+  const message = byClass(failed, 'cs-tidy-status__error')[0]
+  assert.equal(message.props.title, text, 'the full text is on hover when the toolbar clips it')
+})
+
+test('once a line is mounted the toolbar seat leaves the status to it, and takes it back when the line goes', async () => {
+  const { app, button, line, press, inline } = tidyApp()
+  press(button({ draft: LONG })).props.onClick()
+  await tick()
+  assert.ok(inline(button()))
+
+  line()
+  assert.equal(inline(button()), undefined)
+  assert.equal(textOf(line()), `${DONE_TEXT} Restore ×`)
+
+  // The line's seat now renders another Session: its effect for this one is cleaned up.
+  const other = app.renderSeat(DOCK, { sessionId: 's2' })
+  for (const effect of other.effects) effect()
+  assert.ok(inline(button()))
+})
+
+test('a composer that goes away cancels its rewrite, so a later answer cannot replace anything', async () => {
+  const gate = deferred()
+  const { app, button, press, tidy } = tidyApp({ fetch: () => gate.promise })
+  press(button({ draft: LONG })).props.onClick()
+  assert.equal(tidy.read('s1').phase, 'working')
+  // The seat now renders another Session: the effect for the old one is cleaned up.
+  button({ draft: '', sessionId: 's2' })
+  assert.equal(app.fetchCalls[0].init.signal.aborted, true)
+  gate.resolve(streamResponse(tidyDone()))
+  await tick()
+  assert.equal(app.replaced.length, 0)
+  assert.equal(tidy.read('s1').phase, 'idle')
+})
+
+test('tidy uses the model chosen in Settings, and its switch removes the button, the status and the shortcut', async () => {
+  const pinned = tidyApp({ prefs: { next: true, continue: true, tidy: true, model: 'deepseek-flash' } })
+  pinned.press(pinned.button({ draft: LONG })).props.onClick()
+  await tick()
+  same(JSON.parse(pinned.app.fetchCalls[0].init.body), { sessionId: 's1', mode: 'tidy', draft: LONG, model: 'deepseek-flash' })
+
+  const off = tidyApp({ prefs: { next: true, continue: true, tidy: false, model: '' } })
+  const seat = off.button({ draft: LONG })
+  assert.equal(off.press(seat), undefined)
+  assert.equal(off.inline(seat), undefined)
+  const event = altT()
+  off.app.listeners.get('keydown')(event)
+  assert.equal(event.prevented, false)
+  assert.equal(off.app.fetchCalls.length, 0)
+  assert.equal(off.line(), null)
+})
+
+test('the suggestion overlay still never replaces the draft', () => {
+  const app = load()
+  const rendered = app.render({ draft: '', ghost: { items: ['Run it again'] } })
+  runEffects(rendered)
+  rendered.listeners.get('keydown')(keyEvent('Tab'))
+  same(app.inserted, ['Run it again'])
+  assert.equal(app.replaced.length, 0)
 })
