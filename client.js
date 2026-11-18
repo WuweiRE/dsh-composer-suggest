@@ -103,7 +103,6 @@ window.__ModuleLoader__.load({
     const DICTIONARIES = {
       en: {
         label: 'Composer suggestion',
-        accept: 'Press Tab to accept this suggestion',
         cancel: 'Press Esc to cancel',
         more: 'Alt+Down for the next suggestion',
         next: 'Suggest my next message',
@@ -156,7 +155,6 @@ window.__ModuleLoader__.load({
       },
       zh: {
         label: '输入建议',
-        accept: '按 Tab 采纳该建议',
         cancel: '按 Esc 取消',
         more: '按 Alt+↓ 查看下一条建议',
         next: '建议下一条消息',
@@ -1351,7 +1349,6 @@ window.__ModuleLoader__.load({
           h('span', { style: textStyle }, current),
           pending ? spinner : null,
           ghost.items.length > 1 ? h('span', { style: BADGE_STYLE, title: t('more') }, `${ghost.index + 1}/${ghost.items.length}`) : null,
-          !ghost.active ? h('kbd', { style: KEYCAP_STYLE, title: t('accept') }, 'Tab') : null,
         ]
       }
       const announcement = hasNotice

@@ -1000,7 +1000,7 @@ test('final suggestions are announced, previews are not, and the ghost carries t
   assert.equal(preview.children[0].children[0], '')
 })
 
-test('the composer shows that the model is continuing, then the text, then the Tab hint', () => {
+test('the composer shows that the model is continuing, then the text, with no Tab keycap', () => {
   const app = load()
 
   const waiting = app.render({ draft: 'Can you also', ghost: { mode: 'continue', active: true } }).tree
@@ -1017,14 +1017,18 @@ test('the composer shows that the model is continuing, then the text, then the T
   assert.equal(streamingChip.props['data-composer-suggest-state'], 'pending')
   assert.equal(streamingChip.children[0].children[0], ' update the README')
   assert.equal(streamingChip.children[1].props.className, 'cs-spin')
-  assert.ok(!streamingChip.children.some((child) => child && child.type === 'kbd'), 'no Tab hint until the text is final')
+  assert.ok(!streamingChip.children.some((child) => child && child.type === 'kbd'), 'no keycap while streaming')
 
   const done = app.render({ draft: 'Can you also', ghost: { mode: 'continue', items: [' update the README', ' add tests'] } }).tree
   const doneChip = done.children[1]
   assert.equal(doneChip.props['data-composer-suggest-state'], 'ready')
   assert.equal(doneChip.children[0].children[0], ' update the README')
   assert.equal(doneChip.children[2].children[0], '1/2')
-  assert.equal(doneChip.children[3].children[0], 'Tab')
+  // Tab accepts without being shown: the keycap could wrap onto a line of its own.
+  assert.equal(doneChip.children.length, 3)
+  assert.ok(!doneChip.children.some((child) => child && child.type === 'kbd'))
+  // Screen readers are still told how to accept.
+  assert.match(done.children[0].children[0], /Press Tab to accept/)
 })
 
 test('a failed or empty continuation shows a short notice that clears itself', () => {
@@ -1088,17 +1092,15 @@ test('a next-message suggestion also wraps in the text column instead of being c
   assert.equal(tree.children[1].children[0].children[0], long)
 })
 
-test('the first-line indent stays on the text: the count, the Tab hint and the spinner do not inherit it', () => {
+test('the first-line indent stays on the text: the count and the spinner do not inherit it', () => {
   const app = load()
   const box = { top: 30, left: 420, maxWidth: 164, height: 24, columnLeft: 14, right: 12, lineBreak: false }
   const tree = app.render({ draft: '理一下', ghost: { mode: 'continue', items: [' 更新一下', ' 再改一下'] }, box }).tree
   const chip = tree.children[1]
   assert.equal(chip.props.style.textIndent, 406, 'the block indents its first line to the caret')
-  const [, , badge, keycap] = chip.children
+  const [, , badge] = chip.children
   assert.equal(badge.props.style.textIndent, 0, 'text-indent is inherited, so the small pieces reset it')
-  assert.equal(keycap.props.style.textIndent, 0)
-  assert.equal(keycap.props.style.whiteSpace, 'nowrap', 'the Tab hint never splits over two lines')
-  assert.equal(badge.props.style.whiteSpace, 'nowrap')
+  assert.equal(badge.props.style.whiteSpace, 'nowrap', 'the count never splits over two lines')
   const css = tree.children.find((child) => child && child.type === 'style').children[0]
   assert.match(css, /\.cs-spin\{[^}]*text-indent:0/)
 })
@@ -1152,12 +1154,14 @@ test('the first line of a continuation sits on the draft\'s own line, not lower 
   assert.equal(flat.state[1].top, 10)
 })
 
-test('the text, the candidate count and the Tab hint flow together after the text', () => {
+test('the text and the candidate count flow together, with nothing after them', () => {
   const app = load()
   const chip = app.render({ draft: 'Can you also', ghost: { mode: 'continue', items: [' run the tests', ' add a test'] } }).tree.children[1]
-  assert.deepEqual(chip.children.map((child) => child && (child.type === 'kbd' ? 'kbd' : child.type)), ['span', null, 'span', 'kbd'])
-  assert.equal(chip.children[3].props.style.display, 'inline-block')
+  assert.deepEqual(chip.children.map((child) => child && child.type), ['span', null, 'span'])
   assert.equal(chip.children[2].props.style.display, 'inline-block')
+  // A single candidate has no count either: the ghost is the text alone.
+  const single = app.render({ draft: '', ghost: { mode: 'next', items: ['Run it again'] } }).tree.children[1]
+  assert.deepEqual(single.children.map((child) => child && child.type), ['span', null, null])
 })
 
 test('a ghost taller than the editor pushes the toolbar down by exactly the overflow, and gives it back', () => {
